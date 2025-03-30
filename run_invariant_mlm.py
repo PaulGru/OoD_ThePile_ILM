@@ -136,6 +136,14 @@ class ModelArguments:
         default=True,
         metadata={"help": "Lower-case during tokenization."},
     )
+    dropout: float = field(
+        default=0.1,
+        metadata={"help": "Taux de dropout pour le modèle."}
+    )
+    attention_dropout: float = field(
+        default=0.1,
+        metadata={"help": "Taux de dropout pour l'attention."}
+    )
 
 
 @dataclass
@@ -351,16 +359,11 @@ def main():
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForMaskedLM.from_config(config)
+    
+    model.config.dropout = 0.25
+    model.config.attention_dropout = 0.25
 
     envs = [k for k in irm_datasets.keys() if 'validation' not in k]
-
-    def is_jsonable(x):
-        import json
-        try:
-            json.dumps(x)
-            return True
-        except:
-            return False
 
     if 'envs' not in config.to_dict(): #if we didn't already load from pretrained an irm model
         if 'distil' in model_args.model_name_or_path:
@@ -382,7 +385,6 @@ def main():
     # Preprocessing the datasets.
     # First we tokenize all the texts.
     irm_tokenized_datasets = {}
-
 
 
     for env_name, datasets in irm_datasets.items():
@@ -519,15 +521,17 @@ def main():
         if model_args.ensembling:
             logger.info("TRAINING WITH ENSEMBLE -- NOT FOLLOWING IRM-GAMES DYNAMIC")
             train_result = trainer.ensemble_train(training_set=train_tokenized_datasets,
-                                                   nb_steps=nb_steps,
+                                                   # nb_steps=nb_steps,
                                                    nb_steps_heads_saving=model_args.nb_steps_heads_saving,
                                                    nb_steps_model_saving=model_args.nb_steps_model_saving,
+                                                   num_train_epochs=training_args.num_train_epochs,
                                                    )
         else:
             train_result = trainer.invariant_train(training_set=train_tokenized_datasets,
-                                                    nb_steps=nb_steps,
+                                                    #nb_steps=nb_steps,
                                                     nb_steps_heads_saving=model_args.nb_steps_heads_saving,
                                                     nb_steps_model_saving=model_args.nb_steps_model_saving,
+                                                    num_train_epochs=training_args.num_train_epochs,
                                                     )
         
         # trainer.save_model()  # Saves the tokenizer too for easy upload

@@ -134,8 +134,13 @@ class InvariantTrainer(transformers.Trainer):
         saving_intermediary_models = bool(nb_steps_model_saving > 0)
         total_trained_steps = 0
 
+        # Set how often you want to run evaluation (in epochs)
+        eval_frequency = 5  # for example, evaluate every 5 epochs
+
         for epoch in range(num_train_epochs):
-            logger.info(f" Epoch: {epoch}")
+            # Affichage du début de l'époque (en base 1)
+            print(f"=== Début de l'époque {epoch+1}/{num_train_epochs} ===")
+            logger.info(f"Epoch: {epoch}")
         
             # make all dataloader iterateable
             iter_loaders = {}
@@ -143,84 +148,90 @@ class InvariantTrainer(transformers.Trainer):
                 train_loader = dataloaders[env_name]
                 iter_loaders[env_name] = iter(train_loader)
 
-        # [ADDED] Initialize accumulators for the epoch's training loss
-        epoch_loss_sum = 0.0
-        epoch_loss_count = 0
+            # [ADDED] Initialize accumulators for the epoch's training loss
+            epoch_loss_sum = 0.0
+            epoch_loss_count = 0
 
-        for steps_trained_in_current_epoch in tqdm(range(num_update_steps_per_epoch)):
-            if total_trained_steps >= max_steps:
-                break
+            for steps_trained_in_current_epoch in tqdm(range(num_update_steps_per_epoch)):
+                #if total_trained_steps >= max_steps:
+                    #break
 
-            for env_name in training_set.keys():
-                logger.info(f" Update on environment {env_name}")
-                # get a batch
-                optimizer.zero_grad()
-                optimizers[env_name].zero_grad()
+                for env_name in training_set.keys():
+                    logger.info(f" Update on environment {env_name}")
+                    # get a batch
+                    optimizer.zero_grad()
+                    optimizers[env_name].zero_grad()
 
-                inputs = next(iter_loaders[env_name])
+                    inputs = next(iter_loaders[env_name])
 
-                # make an update
-                loss = self.training_step(self.model, inputs)
+                    # make an update
+                    loss = self.training_step(self.model, inputs)
 
-                # [ADDED] Accumulate the training loss for logging
-                epoch_loss_sum += loss.item()
-                epoch_loss_count += 1
+                    # [ADDED] Accumulate the training loss for logging
+                    epoch_loss_sum += loss.item()
+                    epoch_loss_count += 1
 
-                if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
-                    if hasattr(optimizer, "clip_grad_norm"):
-                        # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
-                        optimizer.clip_grad_norm(self.args.max_grad_norm)
-                        optimizers[env_name].clip_grad_norm(self.args.max_grad_norm)
-                    else:
-                        # Revert to normal clipping otherwise, handling Apex or full precision
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
-                            self.args.max_grad_norm,
-                        )
+                    if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
+                        if hasattr(optimizer, "clip_grad_norm"):
+                            # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
+                            optimizer.clip_grad_norm(self.args.max_grad_norm)
+                            optimizers[env_name].clip_grad_norm(self.args.max_grad_norm)
+                        else:
+                            # Revert to normal clipping otherwise, handling Apex or full precision
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(),
+                                self.args.max_grad_norm,
+                            )
 
-            optimizer.step()
-            optimizers[env_name].step()
+                optimizer.step()
+                optimizers[env_name].step()
 
-            lr_scheduler.step()
-            lr_schedulers[env_name].step()
+                lr_scheduler.step()
+                lr_schedulers[env_name].step()
 
-            total_trained_steps += 1
-            if saving_heads:
-                if total_trained_steps % nb_steps_heads_saving == 0:
-                    self.save_heads(total_trained_steps)
-            if saving_intermediary_models:
-                if total_trained_steps % nb_steps_model_saving == 0:
-                    self.save_intermediary_model(total_trained_steps)
+                total_trained_steps += 1
+                if saving_heads:
+                    if total_trained_steps % nb_steps_heads_saving == 0:
+                        self.save_heads(total_trained_steps)
+                if saving_intermediary_models:
+                    if total_trained_steps % nb_steps_model_saving == 0:
+                        self.save_intermediary_model(total_trained_steps)
     
-        # [ADDED] After finishing all update steps of the epoch:
-        # Calculate average training loss for the epoch.
-        avg_train_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count > 0 else 0.0
+            # [ADDED] After finishing all update steps of the epoch:
+            # Calculate average training loss for the epoch.
+            avg_train_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count > 0 else 0.0
 
-        # Evaluate on the validation set (if available) to compute validation loss and perplexity.
-        eval_loss = None
-        perplexity = None
-        if self.eval_dataset is not None:
-            eval_metrics = self.evaluate()  # This returns a dict with metrics, including "eval_loss"
-            eval_loss = eval_metrics.get("eval_loss")
-            if eval_loss is not None:
-                perplexity = math.exp(eval_loss)
+            # Evaluate on the validation set (if available) to compute validation loss and perplexity.
+            eval_loss = None
+            perplexity = None
+            if self.eval_dataset is not None:
+                eval_metrics = self.evaluate()  # This returns a dict with metrics, including "eval_loss"
+                eval_loss = eval_metrics.get("eval_loss")
+                if eval_loss is not None:
+                    perplexity = math.exp(eval_loss)
 
-        # [ADDED] Log the metrics to a CSV file (only in the main process)
-        if self.is_world_process_zero():
-            log_path = os.path.join(self.args.output_dir, "training_log.csv")
-            # On first epoch, write the header if file doesn't exist.
-            if epoch == 0 and not os.path.exists(log_path):
-                with open(log_path, "w") as f:
-                    f.write("epoch,train_loss,val_loss,perplexity\n")
-            # Append the metrics for the current epoch.
-            with open(log_path, "a") as f:
-                val_str = f"{eval_loss:.4f}" if eval_loss is not None else ""
-                ppl_str = f"{perplexity:.4f}" if perplexity is not None else ""
-                f.write(f"{epoch},{avg_train_loss:.4f},{val_str},{ppl_str}\n")
+            if self.is_world_process_zero():
+                log_path = os.path.join(self.args.output_dir, "training_log.csv")
+                if epoch == 0 and os.path.exists(log_path):
+                    os.remove(log_path)
 
-        logger.info(f"Epoch {epoch}: Train Loss: {avg_train_loss:.4f}, "
-                f"Val Loss: {eval_loss:.4f if eval_loss is not None else 'N/A'}, "
-                f"Perplexity: {perplexity:.4f if perplexity is not None else 'N/A'}")
+              # On first evaluation, write header if file doesn't exist
+                if epoch == 0 and not os.path.exists(log_path):
+                    with open(log_path, "w") as f:
+                        f.write("epoch,train_loss,val_loss,perplexity\n")
+                with open(log_path, "a") as f:
+                    val_str = f"{eval_loss:.4f}" if eval_loss is not None else ""
+                    ppl_str = f"{perplexity:.4f}" if perplexity is not None else ""
+                    f.write(f"{epoch+1},{avg_train_loss:.4f},{val_str},{ppl_str}\n")
+
+
+            # Compute formatted strings outside the f-string
+            val_loss_str = f"{eval_loss:.4f}" if eval_loss is not None else "N/A"
+            ppl_str = f"{perplexity:.4f}" if perplexity is not None else "N/A"
+
+            print(f"=== Fin de l'époque {epoch+1} : Loss = {avg_train_loss:.4f}, Val Loss = {val_loss_str}, Perplexité = {ppl_str} ===")
+            logger.info(f"Fin de l'époque {epoch+1} : Train Loss = {avg_train_loss:.4f}, Val Loss = {val_loss_str}, Perplexité = {ppl_str}")
+
 
     def ensemble_train(
             self,
@@ -367,8 +378,19 @@ class InvariantTrainer(transformers.Trainer):
             os.makedirs("lm_heads")
 
         for env, lm_head in self.model.lm_heads.items():
+            # Vérifier si l'environnement existe réellement
+            if lm_head is None:
+                print(f"Environnement {env} ignoré (aucune tête associée).")
+                continue
+            
             filepath = os.path.join("lm_heads", "{}-{}".format(env, step_count))
-            np.save(filepath, lm_head.dense.weight.data.cpu().numpy())
+            if hasattr(lm_head, "dense"):
+                np.save(filepath, lm_head.dense.weight.data.cpu().numpy())
+            elif hasattr(lm_head, "decoder"):
+                np.save(filepath, lm_head.decoder.weight.data.cpu().numpy())
+            else:
+                raise AttributeError(f"lm_head for environment {env} does not have attribute 'dense' or 'decoder'")
+
 
     def get_single_train_dataloader(self, env_name, train_dataset):
         """
