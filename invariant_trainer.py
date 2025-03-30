@@ -4,7 +4,8 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data.sampler import RandomSampler
 
 import transformers
-from transformers.optimization import Adafactor, AdamW, get_scheduler
+from transformers.optimization import Adafactor, get_scheduler
+from torch.optim import AdamW
 from transformers.trainer_callback import TrainerState
 from transformers.utils import logging
 
