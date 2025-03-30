@@ -135,55 +135,91 @@ class InvariantTrainer(transformers.Trainer):
 
         for epoch in range(num_train_epochs):
             logger.info(f" Epoch: {epoch}")
-
+        
             # make all dataloader iterateable
             iter_loaders = {}
             for env_name in training_set.keys():
                 train_loader = dataloaders[env_name]
                 iter_loaders[env_name] = iter(train_loader)
 
-            for steps_trained_in_current_epoch in tqdm(range(num_update_steps_per_epoch)):
-                if total_trained_steps >= max_steps:
-                    break
+        # [ADDED] Initialize accumulators for the epoch's training loss
+        epoch_loss_sum = 0.0
+        epoch_loss_count = 0
 
-                for env_name in training_set.keys():
-                    logger.info(f" Update on environement {env_name}")
-                    # get a batch
-                    optimizer.zero_grad()
-                    optimizers[env_name].zero_grad()
+        for steps_trained_in_current_epoch in tqdm(range(num_update_steps_per_epoch)):
+            if total_trained_steps >= max_steps:
+                break
 
-                    inputs = next(iter_loaders[env_name])
+            for env_name in training_set.keys():
+                logger.info(f" Update on environment {env_name}")
+                # get a batch
+                optimizer.zero_grad()
+                optimizers[env_name].zero_grad()
 
-                    # make an update
-                    loss = self.training_step(self.model, inputs)
+                inputs = next(iter_loaders[env_name])
 
-                    if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
-                        
-                        if hasattr(optimizer, "clip_grad_norm"):
-                            # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
-                            optimizer.clip_grad_norm(self.args.max_grad_norm)
-                            optimizers[env_name].clip_grad_norm(self.args.max_grad_norm)
-                        else:
-                            # Revert to normal clipping otherwise, handling Apex or full precision
-                            torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(),
-                                self.args.max_grad_norm,
-                            )
+                # make an update
+                loss = self.training_step(self.model, inputs)
 
-                    
-                    optimizer.step()
-                    optimizers[env_name].step()
+                # [ADDED] Accumulate the training loss for logging
+                epoch_loss_sum += loss.item()
+                epoch_loss_count += 1
 
-                    lr_scheduler.step()
-                    lr_schedulers[env_name].step()
+                if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
+                    if hasattr(optimizer, "clip_grad_norm"):
+                        # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
+                        optimizer.clip_grad_norm(self.args.max_grad_norm)
+                        optimizers[env_name].clip_grad_norm(self.args.max_grad_norm)
+                    else:
+                        # Revert to normal clipping otherwise, handling Apex or full precision
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.args.max_grad_norm,
+                        )
 
-                    total_trained_steps += 1
-                    if saving_heads:
-                        if total_trained_steps % nb_steps_heads_saving == 0:
-                            self.save_heads(total_trained_steps)
-                    if saving_intermediary_models:
-                        if total_trained_steps % nb_steps_model_saving == 0:
-                            self.save_intermediary_model(total_trained_steps)
+            optimizer.step()
+            optimizers[env_name].step()
+
+            lr_scheduler.step()
+            lr_schedulers[env_name].step()
+
+            total_trained_steps += 1
+            if saving_heads:
+                if total_trained_steps % nb_steps_heads_saving == 0:
+                    self.save_heads(total_trained_steps)
+            if saving_intermediary_models:
+                if total_trained_steps % nb_steps_model_saving == 0:
+                    self.save_intermediary_model(total_trained_steps)
+    
+        # [ADDED] After finishing all update steps of the epoch:
+        # Calculate average training loss for the epoch.
+        avg_train_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count > 0 else 0.0
+
+        # Evaluate on the validation set (if available) to compute validation loss and perplexity.
+        eval_loss = None
+        perplexity = None
+        if self.eval_dataset is not None:
+            eval_metrics = self.evaluate()  # This returns a dict with metrics, including "eval_loss"
+            eval_loss = eval_metrics.get("eval_loss")
+            if eval_loss is not None:
+                perplexity = math.exp(eval_loss)
+
+        # [ADDED] Log the metrics to a CSV file (only in the main process)
+        if self.is_world_process_zero():
+            log_path = os.path.join(self.args.output_dir, "training_log.csv")
+            # On first epoch, write the header if file doesn't exist.
+            if epoch == 0 and not os.path.exists(log_path):
+                with open(log_path, "w") as f:
+                    f.write("epoch,train_loss,val_loss,perplexity\n")
+            # Append the metrics for the current epoch.
+            with open(log_path, "a") as f:
+                val_str = f"{eval_loss:.4f}" if eval_loss is not None else ""
+                ppl_str = f"{perplexity:.4f}" if perplexity is not None else ""
+                f.write(f"{epoch},{avg_train_loss:.4f},{val_str},{ppl_str}\n")
+
+        logger.info(f"Epoch {epoch}: Train Loss: {avg_train_loss:.4f}, "
+                f"Val Loss: {eval_loss:.4f if eval_loss is not None else 'N/A'}, "
+                f"Perplexity: {perplexity:.4f if perplexity is not None else 'N/A'}")
 
     def ensemble_train(
             self,
