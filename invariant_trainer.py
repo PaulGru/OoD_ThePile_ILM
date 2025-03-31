@@ -378,9 +378,9 @@ class InvariantTrainer(transformers.Trainer):
             os.makedirs("lm_heads")
 
         for env, lm_head in self.model.lm_heads.items():
-            # Vérifier si l'environnement existe réellement
-            if lm_head is None:
-                print(f"Environnement {env} ignoré (aucune tête associée).")
+            # Ignorer l'environnement de validation
+            if env == "val_ind":
+                print(f"Environnement {env} ignoré lors de la sauvegarde des heads.")
                 continue
             
             filepath = os.path.join("lm_heads", "{}-{}".format(env, step_count))
