@@ -310,7 +310,7 @@ class InvariantTrainer(transformers.Trainer):
         print("Train data size: ", min_train_set_size)
         print("num_update_steps_per_epoch: ", num_update_steps_per_epoch)
 
-        for epoch in range(num_train_epochs):
+        for epoch in range(int(num_train_epochs)):
             logger.info(f" Epoch: {epoch}")
             print("epoch: ", epoch)
             # make all dataloader iterateable
