@@ -14,7 +14,7 @@ from tqdm import tqdm
 import math
 import os
 import numpy as np
-from typing import List, Union, Dict, Optional
+from typing import Optional
 
 logger = logging.get_logger(__name__)
 
@@ -134,10 +134,7 @@ class InvariantTrainer(transformers.Trainer):
         saving_intermediary_models = bool(nb_steps_model_saving > 0)
         total_trained_steps = 0
 
-        # Set how often you want to run evaluation (in epochs)
-        eval_frequency = 5  # for example, evaluate every 5 epochs
-
-        for epoch in range(num_train_epochs):
+        for epoch in range(int(num_train_epochs)):
             # Affichage du début de l'époque (en base 1)
             print(f"=== Début de l'époque {epoch+1}/{num_train_epochs} ===")
             logger.info(f"Epoch: {epoch}")
@@ -378,10 +375,11 @@ class InvariantTrainer(transformers.Trainer):
             os.makedirs("lm_heads")
 
         for env, lm_head in self.model.lm_heads.items():
-            # Ignorer l'environnement de validation
-            if env == "val_ind":
-                print(f"Environnement {env} ignoré lors de la sauvegarde des heads.")
+            
+            if not (hasattr(lm_head, "dense") or hasattr(lm_head, "decoder")):
+                print(f"Avertissement : la tête pour l'environnement {env} ne possède ni 'dense' ni 'decoder'. Enregistrement ignoré.")
                 continue
+
             
             filepath = os.path.join("lm_heads", "{}-{}".format(env, step_count))
             if hasattr(lm_head, "dense"):
