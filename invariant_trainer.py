@@ -328,8 +328,12 @@ class InvariantTrainer(transformers.Trainer):
                         optimizers[e_n].zero_grad()
 
                     batch = next(iter_loaders[env_name])
-                    # uncomment it, for CPU only run
-                    batch.to(self.args.device)
+                    # Déplacer le batch sur le même device que le modèle
+                    if isinstance(batch, dict):
+                        batch = {key: value.to(self.args.device) for key, value in batch.items()}
+                    else:
+                        batch = batch.to(self.args.device)
+
 
                     # loss.backward() is done inside training step
                     loss = self.training_step(self.model, batch)
