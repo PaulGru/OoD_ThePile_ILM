@@ -151,7 +151,6 @@ class DataTrainingArguments:
     """
     Arguments pertaining to what data we are going to input our model for training and eval.
     """
-
     dataset_name: Optional[str] = field(
         default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
@@ -381,6 +380,13 @@ def main():
         irm_model.init_head()
     if model_args.init_base:
         irm_model.init_base()
+
+    # Freeze les 4 premières couches de l'encodeur DistilBert
+    if hasattr(irm_model, 'encoder') and hasattr(irm_model.encoder, 'transformer'):
+        for layer in irm_model.encoder.transformer.layer[:4]:
+            for param in layer.parameters():
+                param.requires_grad = False
+
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.

@@ -133,6 +133,7 @@ class InvariantTrainer(transformers.Trainer):
         saving_heads = bool(nb_steps_heads_saving > 0)
         saving_intermediary_models = bool(nb_steps_model_saving > 0)
         total_trained_steps = 0
+        log_interval = 50  # par exemple, log tous les 100 steps
 
         for epoch in range(int(num_train_epochs)):
             # Affichage du début de l'époque (en base 1)
@@ -179,55 +180,69 @@ class InvariantTrainer(transformers.Trainer):
                                 self.model.parameters(),
                                 self.args.max_grad_norm,
                             )
+                
+                    optimizer.step()
+                    optimizers[env_name].step()
 
-                optimizer.step()
-                optimizers[env_name].step()
+                    lr_scheduler.step()
+                    lr_schedulers[env_name].step()
 
-                lr_scheduler.step()
-                lr_schedulers[env_name].step()
+                    total_trained_steps += 1
 
-                total_trained_steps += 1
-                if saving_heads:
-                    if total_trained_steps % nb_steps_heads_saving == 0:
-                        self.save_heads(total_trained_steps)
-                if saving_intermediary_models:
-                    if total_trained_steps % nb_steps_model_saving == 0:
-                        self.save_intermediary_model(total_trained_steps)
-    
-            # [ADDED] After finishing all update steps of the epoch:
-            # Calculate average training loss for the epoch.
+                    if saving_heads and total_trained_steps % nb_steps_heads_saving == 0:
+                            self.save_heads(total_trained_steps)
+                    if saving_intermediary_models and total_trained_steps % nb_steps_model_saving == 0:
+                            self.save_intermediary_model(total_trained_steps)
+        
+                
+                # [ADDED] After finishing all update steps of the epoch:
+                if total_trained_steps % log_interval == 0:
+                # Calculate average training loss for the epoch.
+                    avg_train_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count > 0 else 0.0
+
+                    # Evaluate on the validation set (if available) to compute validation loss and perplexity.
+                    eval_loss = None
+                    perplexity = None
+                    if self.eval_dataset is not None:
+                        eval_metrics = self.evaluate()  # This returns a dict with metrics, including "eval_loss"
+                        eval_loss = eval_metrics.get("eval_loss")
+                        if eval_loss is not None:
+                            perplexity = math.exp(eval_loss)
+
+                    if self.is_world_process_zero():
+                        log_path = os.path.join(self.args.output_dir, "training_log.csv")
+                        
+                        if total_trained_steps == log_interval and os.path.exists(log_path):
+                            os.remove(log_path)
+
+                        # On first evaluation, write header if file doesn't exist
+                        if total_trained_steps == log_interval and not os.path.exists(log_path):
+                            with open(log_path, "w") as f:
+                                f.write("epoch,train_loss,val_loss,perplexity\n")
+                        with open(log_path, "a") as f:
+                            val_str = f"{eval_loss:.4f}" if eval_loss is not None else ""
+                            ppl_str = f"{perplexity:.4f}" if perplexity is not None else ""
+                            f.write(f"{epoch+1},{total_trained_steps},{avg_train_loss:.4f},{val_str},{ppl_str}\n")
+
+                    # Affichage dans la console
+                    print(f"Step {total_trained_steps} (Epoch {epoch+1}): Train Loss = {avg_train_loss:.4f}, Val Loss = {val_str if eval_loss is not None else 'N/A'}, Perplexity = {ppl_str if perplexity is not None else 'N/A'}")
+
+
+            # Fin de l'époque, affichage d'un résumé
             avg_train_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count > 0 else 0.0
-
-            # Evaluate on the validation set (if available) to compute validation loss and perplexity.
             eval_loss = None
             perplexity = None
             if self.eval_dataset is not None:
-                eval_metrics = self.evaluate()  # This returns a dict with metrics, including "eval_loss"
+                eval_metrics = self.evaluate()
                 eval_loss = eval_metrics.get("eval_loss")
                 if eval_loss is not None:
                     perplexity = math.exp(eval_loss)
-
-            if self.is_world_process_zero():
-                log_path = os.path.join(self.args.output_dir, "training_log.csv")
-                if epoch == 0 and os.path.exists(log_path):
-                    os.remove(log_path)
-
-              # On first evaluation, write header if file doesn't exist
-                if epoch == 0 and not os.path.exists(log_path):
-                    with open(log_path, "w") as f:
-                        f.write("epoch,train_loss,val_loss,perplexity\n")
-                with open(log_path, "a") as f:
-                    val_str = f"{eval_loss:.4f}" if eval_loss is not None else ""
-                    ppl_str = f"{perplexity:.4f}" if perplexity is not None else ""
-                    f.write(f"{epoch+1},{avg_train_loss:.4f},{val_str},{ppl_str}\n")
-
-
-            # Compute formatted strings outside the f-string
             val_loss_str = f"{eval_loss:.4f}" if eval_loss is not None else "N/A"
             ppl_str = f"{perplexity:.4f}" if perplexity is not None else "N/A"
-
             print(f"=== Fin de l'époque {epoch+1} : Loss = {avg_train_loss:.4f}, Val Loss = {val_loss_str}, Perplexité = {ppl_str} ===")
             logger.info(f"Fin de l'époque {epoch+1} : Train Loss = {avg_train_loss:.4f}, Val Loss = {val_loss_str}, Perplexité = {ppl_str}")
+
+
 
 
     def ensemble_train(

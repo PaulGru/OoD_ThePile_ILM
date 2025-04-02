@@ -49,34 +49,30 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
             )
 
         self.encoder = DistilBertModel(config)
-        self.encoder.to('cuda')
-
+        
         if len(config.envs) == 0:
             self.envs = ['erm']
         else:
             self.envs = config.envs
 
-        self.lm_heads = {}
+        self.lm_heads = nn.ModuleDict()
         for env_name in self.envs:
             self.lm_heads[env_name] = DistilBertLMHead(config)
 
         if model is not None:
             self.encoder = copy.deepcopy(model.distilbert)
-            self.lm_heads = {}
+            self.lm_heads = nn.ModuleDict()
             for env_name in self.envs:
-                self.lm_heads[env_name] = DistilBertLMHead(config)
-                self.lm_heads[env_name].vocab_transform = copy.deepcopy(model.vocab_transform)
-                self.lm_heads[env_name].vocab_layer_norm = copy.deepcopy(model.vocab_layer_norm)
-                self.lm_heads[env_name].vocab_projector = copy.deepcopy(model.vocab_projector)
-                # self.register_parameter(env_name + '-head', self.lm_heads[env_name])
+                head = DistilBertLMHead(config)
+                head.vocab_transform = copy.deepcopy(model.vocab_transform)
+                head.vocab_layer_norm = copy.deepcopy(model.vocab_layer_norm)
+                head.vocab_projector = copy.deepcopy(model.vocab_projector)
+                self.lm_heads[env_name] = head
 
         for env_name, lm_head in self.lm_heads.items():
             self.__setattr__(env_name + '_head', self.lm_heads[env_name])
 
-        self.encoder.to('cuda')
-        for _, lm_head in self.lm_heads.items():
-            lm_head.to('cuda')
-
+        
         self.n_environments = len(self.lm_heads)
 
     def print_lm_w(self):
