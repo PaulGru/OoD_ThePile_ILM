@@ -229,7 +229,7 @@ def main():
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     nb_steps = data_args.nb_steps
-    training_args.local_rank = -1  # Force explicitement le local_rank à -1 (pas de distributed)
+    #training_args.local_rank = -1  # Force explicitement le local_rank à -1 (pas de distributed)
 
     # Detecting last checkpoint.
     last_checkpoint = None
@@ -376,17 +376,22 @@ def main():
 
     irm_model.resize_token_embeddings(len(tokenizer))
 
+    # Freeze les 4 premières couches de l'encodeur DistilBert
+    if hasattr(irm_model.encoder, "transformer") and hasattr(irm_model.encoder.transformer, "layer"):
+        for layer in irm_model.encoder.transformer.layer[:4]:
+            for param in layer.parameters():
+                param.requires_grad = False
+        
+        print("Le freeze a été appliqué aux 4 premières couches du modèle")
+    
+    else:
+        print("Les couches n'ont pas été gelées.")
+
+    
     if model_args.init_head:
         irm_model.init_head()
     if model_args.init_base:
         irm_model.init_base()
-
-    # Freeze les 4 premières couches de l'encodeur DistilBert
-    if hasattr(irm_model, 'encoder') and hasattr(irm_model.encoder, 'transformer'):
-        for layer in irm_model.encoder.transformer.layer[:4]:
-            for param in layer.parameters():
-                param.requires_grad = False
-
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
@@ -432,7 +437,7 @@ def main():
         # We use `return_special_tokens_mask=True` because DataCollatorForLanguageModeling (see below) is more
         # efficient when it receives the `special_tokens_mask`.
         def tokenize_function(examples):
-            return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
+            return tokenizer(examples[text_column_name], return_special_tokens_mask=False)
 
         tokenized_datasets = datasets.map(
             tokenize_function,
@@ -501,14 +506,14 @@ def main():
         if model_args.ensembling:
             logger.info("TRAINING WITH ENSEMBLE -- NOT FOLLOWING IRM-GAMES DYNAMIC")
             train_result = trainer.ensemble_train(training_set=train_tokenized_datasets,
-                                                   # nb_steps=nb_steps,
+                                                   nb_steps=nb_steps,
                                                    nb_steps_heads_saving=model_args.nb_steps_heads_saving,
                                                    nb_steps_model_saving=model_args.nb_steps_model_saving,
                                                    num_train_epochs=training_args.num_train_epochs,
                                                    )
         else:
             train_result = trainer.invariant_train(training_set=train_tokenized_datasets,
-                                                    #nb_steps=nb_steps,
+                                                    nb_steps=nb_steps,
                                                     nb_steps_heads_saving=model_args.nb_steps_heads_saving,
                                                     nb_steps_model_saving=model_args.nb_steps_model_saving,
                                                     num_train_epochs=training_args.num_train_epochs,
@@ -517,7 +522,7 @@ def main():
         # trainer.save_model()  # Saves the tokenizer too for easy upload
         output_dir = training_args.output_dir  # ou votre répertoire de sortie
         trainer.model.save_pretrained(output_dir, safe_serialization=False)
-        trainer.tokenizer.save_pretrained(output_dir)
+        trainer.processing_class.save_pretrained(output_dir)
 
 
         output_train_file = os.path.join(training_args.output_dir, "train_results.txt")

@@ -94,6 +94,7 @@ class InvariantTrainer(transformers.Trainer):
             raise TypeError(f"train() received got unexpected keyword arguments: {', '.join(list(kwargs.keys()))}.")
 
         min_train_set_size = min([len(data["train"]) for _, data in training_set.items()])
+        print(min_train_set_size)
 
         if nb_steps is not None:
             max_steps = nb_steps
@@ -116,7 +117,10 @@ class InvariantTrainer(transformers.Trainer):
         optimizer, lr_scheduler = self.create_optimizer_and_scheduler(self.model.encoder, num_training_steps=max_steps)
 
         self.state = TrainerState()
-        self.model.to(self.args.device)
+        if self.args.n_gpu > 0:
+            self.model.to(self.args.device)
+        if self.args.n_gpu >  1:
+            self.model = torch.nn.DataParallel(self.model)
 
         total_train_batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
         num_examples = total_train_batch_size * max_steps
@@ -135,6 +139,8 @@ class InvariantTrainer(transformers.Trainer):
         total_trained_steps = 0
         log_interval = 50  # par exemple, log tous les 100 steps
 
+        scaler = torch.amp.GradScaler() if self.args.fp16 else None
+
         for epoch in range(int(num_train_epochs)):
             # Affichage du début de l'époque (en base 1)
             print(f"=== Début de l'époque {epoch+1}/{num_train_epochs} ===")
@@ -151,8 +157,8 @@ class InvariantTrainer(transformers.Trainer):
             epoch_loss_count = 0
 
             for steps_trained_in_current_epoch in tqdm(range(num_update_steps_per_epoch)):
-                #if total_trained_steps >= max_steps:
-                    #break
+                if total_trained_steps >= max_steps:
+                    break
 
                 for env_name in training_set.keys():
                     logger.info(f" Update on environment {env_name}")
@@ -160,11 +166,13 @@ class InvariantTrainer(transformers.Trainer):
                     optimizer.zero_grad()
                     optimizers[env_name].zero_grad()
 
+                    self.model.train()
+
                     inputs = next(iter_loaders[env_name])
 
                     # make an update
                     loss = self.training_step(self.model, inputs)
-
+                    
                     # [ADDED] Accumulate the training loss for logging
                     epoch_loss_sum += loss.item()
                     epoch_loss_count += 1
@@ -180,7 +188,7 @@ class InvariantTrainer(transformers.Trainer):
                                 self.model.parameters(),
                                 self.args.max_grad_norm,
                             )
-                
+                    
                     optimizer.step()
                     optimizers[env_name].step()
 
@@ -224,8 +232,8 @@ class InvariantTrainer(transformers.Trainer):
                             ppl_str = f"{perplexity:.4f}" if perplexity is not None else ""
                             f.write(f"{epoch+1},{total_trained_steps},{avg_train_loss:.4f},{val_str},{ppl_str}\n")
 
-                    # Affichage dans la console
-                    print(f"Step {total_trained_steps} (Epoch {epoch+1}): Train Loss = {avg_train_loss:.4f}, Val Loss = {val_str if eval_loss is not None else 'N/A'}, Perplexity = {ppl_str if perplexity is not None else 'N/A'}")
+                        # Affichage dans la console
+                        print(f"Step {total_trained_steps} (Epoch {epoch+1}): Train Loss = {avg_train_loss:.4f}, Val Loss = {val_str if eval_loss is not None else 'N/A'}, Perplexity = {ppl_str if perplexity is not None else 'N/A'}")
 
 
             # Fin de l'époque, affichage d'un résumé
