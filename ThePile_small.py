@@ -87,3 +87,10 @@ for env in environments:
     print(f"Environnement: {env}")
     print(f"  Exemples: {num_examples} ({pct_examples:.2f}% du total)")
     print(f"  Tokens: {total_tokens_env} ({pct_tokens:.2f}% du total)")
+
+# Création du fichier combiné pour eLM après avoir généré tous les fichiers d'environnements
+all_train = train_dataset.filter(lambda x: x["environment"] in train_envs)
+output_file = os.path.join(output_folder, "all_train.txt")
+write_dataset_to_file(all_train, output_file)
+print(f"Fichier combiné 'all_train.txt' créé avec {len(all_train)} exemples.")
+

@@ -81,7 +81,7 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
 
     def init_head(self):
         for env_name in self.envs:
-            self.lm_heads[env_name] = DistilBertLMHead(config)
+            self.lm_heads[env_name] = DistilBertLMHead(self.config)
             self.lm_heads[env_name].to('cuda')
 
     def init_base(self):
@@ -121,6 +121,7 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        env_name=None,
         **kwargs
     ):
         r"""
@@ -138,7 +139,15 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
                 FutureWarning,
             )
             labels = kwargs.pop("masked_lm_labels")
-        assert kwargs == {}, f"Unexpected keyword arguments: {list(kwargs.keys())}."
+        
+        # Définir les mots-clés autorisés
+        allowed_kwargs = {"env_name"}
+
+        # Vérifier s'il y a des mots-clés inattendus
+        unexpected_kwargs = [key for key in kwargs.keys() if key not in allowed_kwargs]
+        if unexpected_kwargs:
+            raise AssertionError(f"Unexpected keyword arguments: {unexpected_kwargs}")
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         outputs = self.encoder(
@@ -150,14 +159,22 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+
         sequence_output = outputs[0]
+
         if self.n_environments == 1:
             lm_head = list(self.lm_heads.values())[0]
             prediction_scores = lm_head(sequence_output)
+
+        
+        elif env_name is not None:
+            lm_head = self.lm_heads[env_name]
+            prediction_scores = lm_head(sequence_output)    
+
         else:
             prediction_scores = 0.
-            for env, lm_head in self.lm_heads.items():
-                prediction_scores += 1. / self.n_environments * lm_head(sequence_output)
+            for lm_head in self.lm_heads.values():
+                prediction_scores += lm_head(sequence_output) / self.n_environments
 
         masked_lm_loss = None
         if labels is not None:

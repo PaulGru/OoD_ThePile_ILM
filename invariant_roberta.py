@@ -109,6 +109,7 @@ class InvariantRobertaForMaskedLM(RobertaPreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        env_name=None,
         **kwargs
     ):
         r"""
@@ -145,10 +146,16 @@ class InvariantRobertaForMaskedLM(RobertaPreTrainedModel):
         sequence_output = outputs[0]
         if self.n_environments == 1:
             prediction_scores = list(self.lm_heads.values())[0](sequence_output)
+
+        
+        elif env_name is not None:
+            lm_head = self.lm_heads[env_name]
+            prediction_scores = lm_head(sequence_output)
+
         else:
             prediction_scores = 0.
-            for env, lm_head in self.lm_heads.items():
-                prediction_scores += 1. / self.n_environments * lm_head(sequence_output)
+            for lm_head in self.lm_heads.values():
+                prediction_scores += lm_head(sequence_output) / self.n_environments
 
         masked_lm_loss = None
         if labels is not None:

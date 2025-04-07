@@ -118,8 +118,8 @@ class ModelArguments:
         default=False,
         metadata={"help": "Re-initialize the base language model (and thus the language modeling heads) before training"}
     )
-    ensembling: Optional[bool] = field(
-        default=False,
+    mode: Optional[str] = field(
+        default="iLM",
         metadata={
             "help": "Whether to train the heads as an ensemble instead of following the IRM-games dynamics"}
     )
@@ -251,21 +251,16 @@ def main():
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
+        level=logging.WARNING
     )
-    logger.setLevel(logging.INFO if is_main_process(training_args.local_rank) else logging.WARN)
-
-    # Log on each process the small summary:
-    logger.info(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
-    )
+    logger.setLevel(logging.ERROR)
 
     # Set the verbosity to info of the Transformers logger (on main process only):
     if is_main_process(training_args.local_rank):
-        transformers.utils.logging.set_verbosity_info()
+        transformers.utils.logging.set_verbosity_warning()
         transformers.utils.logging.enable_default_handler()
         transformers.utils.logging.enable_explicit_format()
-    logger.info("Training/evaluation parameters %s", training_args)
+    #logger.info("Training/evaluation parameters %s", training_args)
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
@@ -280,16 +275,32 @@ def main():
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
     
+
     if data_args.train_file is not None:
-        irm_folder = data_args.train_file
-        irm_datasets = {}
-        for file in os.listdir(irm_folder):
-            if file.endswith('.txt'):
-                env_name = file.split(".")[0]
-                data_files = {}
-                data_files["train"] = os.path.join(irm_folder, file)
-                datasets = load_dataset("text", data_files=data_files)
-                irm_datasets[env_name] = datasets
+        
+        if os.path.isfile(data_args.train_file):
+            # eLM : 1 seul fichier (all_train.txt)
+            data_files = {"train": data_args.train_file}
+            dataset = load_dataset("text", data_files=data_files)
+            irm_datasets = {"all": dataset}
+            #envs_list = ["all"]
+        
+        else:
+            # Cas multi-environnements : plusieurs fichiers dans un dossier
+            irm_folder = data_args.train_file
+            irm_datasets = {}
+            for file in os.listdir(irm_folder):
+                if file.endswith('.txt'):
+                    env_name = file.split(".")[0]
+                    if env_name.startswith("val_"):
+                        continue
+                    data_files = {"train": os.path.join(irm_folder, file)}
+                    #data_files = {}
+                    #data_files["train"] = os.path.join(irm_folder, file)
+                    datasets = load_dataset("text", data_files=data_files)
+                    irm_datasets[env_name] = datasets
+                #envs_list = list(irm_datasets.keys())
+
 
     elif data_args.dataset_name is not None:
             
@@ -302,6 +313,7 @@ def main():
         )
 
         irm_datasets = {"train": train_dataset}
+        #envs_list = ["train"]
 
     else:
         raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
@@ -312,7 +324,6 @@ def main():
         eval_datasets = load_dataset("text", data_files=data_files)
         irm_datasets['validation-file'] = eval_datasets
 
-    #
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
@@ -328,6 +339,9 @@ def main():
     else:
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
+    
+
+    #config.envs = envs_list
 
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -335,9 +349,8 @@ def main():
         "revision": model_args.model_revision,
         "use_auth_token": True if model_args.use_auth_token else None,
     }
-    if model_args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
-    elif model_args.model_name_or_path:
+    
+    if model_args.model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
     else:
         raise ValueError(
@@ -362,21 +375,39 @@ def main():
     model.config.dropout = 0.25
     model.config.attention_dropout = 0.25
 
+
     envs = [k for k in irm_datasets.keys() if 'validation' not in k]
 
-    if 'envs' not in config.to_dict(): #if we didn't already load from pretrained an irm model
-        if 'distil' in model_args.model_name_or_path:
-            inv_config = InvariantDistilBertConfig(envs=envs, **config.to_dict())
-            irm_model = InvariantDistilBertForMaskedLM(inv_config, model)
+    if len(envs) > 1:
+        # Plusieurs environnements : on souhaite utiliser iLM, mtLM ou ensLM avec multi-têtes.
+        if 'envs' not in config.to_dict():
+            if 'distil' in model_args.model_name_or_path:
+                config_dict = config.to_dict()
+                config_dict.pop("envs", None)
+                inv_config = InvariantDistilBertConfig(envs=envs, **config_dict)
+                irm_model = InvariantDistilBertForMaskedLM(inv_config, model)
+            else:
+                config_dict = config.to_dict()
+                config_dict.pop("envs", None)
+                inv_config = InvariantRobertaConfig(envs=envs, **config_dict)
+                irm_model = InvariantRobertaForMaskedLM(inv_config, model)
         else:
-            inv_config = InvariantRobertaConfig(envs=envs, **config.to_dict())
-            irm_model = InvariantRobertaForMaskedLM(inv_config, model)
+            irm_model = model
     else:
+        # Cas eLM : un seul environnement, donc on n'enveloppe pas le modèle.
         irm_model = model
 
     irm_model.resize_token_embeddings(len(tokenizer))
 
-    # Freeze les 4 premières couches de l'encodeur DistilBert
+
+    # Freeze la couche d'embedding et les 4 premières couches de l'encodeur DistilBert
+    if hasattr(irm_model.encoder, "embeddings"):
+        for param in irm_model.encoder.embeddings.parameters():
+            param.requires_grad = False
+        print("Le freeze a été appliqué à la couche d'embedding")
+    else:
+        print("La couche d'embedding n'a pas été gelée.")
+
     if hasattr(irm_model.encoder, "transformer") and hasattr(irm_model.encoder.transformer, "layer"):
         for layer in irm_model.encoder.transformer.layer[:4]:
             for param in layer.parameters():
@@ -404,17 +435,15 @@ def main():
             continue
 
         if training_args.do_train and 'validation' not in env_name:
-
             if isinstance(datasets, dict):
                 column_names = datasets["train"].column_names
             else:
+                # Si la clé "train" n'existe pas, on suppose que l'objet datasets est déjà un Dataset.
                 column_names = datasets.column_names
 
         elif training_args.do_eval and 'validation' in env_name:
             column_names = datasets["validation"].column_names
         text_column_name = "content" if "content" in column_names else column_names[0]
-
-
 
 
         if data_args.max_seq_length is None:
@@ -490,20 +519,23 @@ def main():
         args=training_args,
         # train_dataset=tokenized_datasets["train"] if training_args.do_train else None,
         eval_dataset=eval_tokenized_datasets if training_args.do_eval else None,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         data_collator=data_collator,
     )
 
     # Training
     if training_args.do_train:
-        if last_checkpoint is not None:
-            checkpoint = last_checkpoint
-        elif model_args.model_name_or_path is not None and os.path.isdir(model_args.model_name_or_path):
-            checkpoint = model_args.model_name_or_path
-        else:
-            checkpoint = None
 
-        if model_args.ensembling:
+        if model_args.mode == "mtLM":
+            logger.info("TRAINING WITH DIVERSITY -- NOT FOLLOWING IRM-GAMES DYNAMIC")
+            train_result = trainer.multitask_train(training_set=train_tokenized_datasets,
+                                                   nb_steps=nb_steps,
+                                                   nb_steps_heads_saving=model_args.nb_steps_heads_saving,
+                                                   nb_steps_model_saving=model_args.nb_steps_model_saving,
+                                                   num_train_epochs=training_args.num_train_epochs,
+                                                   )
+
+        if model_args.mode == "ensLM":
             logger.info("TRAINING WITH ENSEMBLE -- NOT FOLLOWING IRM-GAMES DYNAMIC")
             train_result = trainer.ensemble_train(training_set=train_tokenized_datasets,
                                                    nb_steps=nb_steps,
@@ -511,7 +543,7 @@ def main():
                                                    nb_steps_model_saving=model_args.nb_steps_model_saving,
                                                    num_train_epochs=training_args.num_train_epochs,
                                                    )
-        else:
+        if model_args.mode == "iLM":
             train_result = trainer.invariant_train(training_set=train_tokenized_datasets,
                                                     nb_steps=nb_steps,
                                                     nb_steps_heads_saving=model_args.nb_steps_heads_saving,
@@ -519,28 +551,17 @@ def main():
                                                     num_train_epochs=training_args.num_train_epochs,
                                                     )
         
-        # trainer.save_model()  # Saves the tokenizer too for easy upload
         output_dir = training_args.output_dir  # ou votre répertoire de sortie
         trainer.model.save_pretrained(output_dir, safe_serialization=False)
-        trainer.processing_class.save_pretrained(output_dir)
+        trainer.tokenizer.save_pretrained(output_dir)
 
 
         output_train_file = os.path.join(training_args.output_dir, "train_results.txt")
         if trainer.is_world_process_zero():
             with open(output_train_file, "w") as writer:
                 logger.info("***** Train results *****")
-#                for key, value in sorted(train_result.metrics.items()):
-#                    logger.info(f"  {key} = {value}")
-#                    writer.write(f"{key} = {value}\n")
 
-            # Need to save the state, since Trainer.save_model saves only the tokenizer with the model
             trainer.state.save_to_json(os.path.join(training_args.output_dir, "trainer_state.json"))
-
-#        metrics = train_result.metrics
-
- #       trainer.log_metrics("train", metrics)
- #       trainer.save_metrics("train", metrics)
-        # trainer.save_state()
 
     # Evaluation
     results = {}
@@ -558,10 +579,7 @@ def main():
                 logger.info("***** Eval results *****")
                 for key, value in sorted(results.items()):
                     logger.info(f"  {key} = {value}")
-#                    writer.write(f"{key} = {value}\n")
-
-        # trainer.log_metrics("eval", results)
-        # trainer.save_metrics("eval", results)
+                    writer.write(f"{key} = {value}\n")
 
     return results
 
