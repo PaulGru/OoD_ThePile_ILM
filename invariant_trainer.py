@@ -67,6 +67,20 @@ class InvariantTrainer(transformers.Trainer):
     def remove_dataparallel_wrapper(self):
         if hasattr(self.model, 'module'):
             self.model = self.model.module
+    
+    def run_evaluation(self):
+        """
+        Exécute l'évaluation sur self.eval_dataset et renvoie un tuple (eval_loss, perplexity).
+        """
+        eval_loss = None
+        perplexity = None
+        if self.eval_dataset is not None:
+            eval_metrics = self.evaluate()  # Utilise la méthode evaluate() héritée (ou définie) dans ta classe Trainer
+            eval_loss = eval_metrics.get("eval_loss")
+            if eval_loss is not None:
+                perplexity = math.exp(eval_loss)
+        return eval_loss, perplexity
+
 
     def invariant_train(
             self,
@@ -77,16 +91,6 @@ class InvariantTrainer(transformers.Trainer):
             nb_steps_model_saving: Optional[int] = 0,
             **kwargs,
     ):
-        """
-        Main training entry point.
-
-        Args:
-            trial (:obj:`optuna.Trial` or :obj:`Dict[str, Any]`, `optional`):
-                The trial run or the hyperparameter dictionary for hyperparameter search.
-            kwargs:
-                Additional keyword arguments used to hide deprecated arguments
-        """
-
         if nb_steps is None and num_train_epochs is None:
             raise ValueError("Both nb_steps and num_train_epochs can't be None at the same time")
 
@@ -94,16 +98,21 @@ class InvariantTrainer(transformers.Trainer):
             raise TypeError(f"train() received got unexpected keyword arguments: {', '.join(list(kwargs.keys()))}.")
 
         min_train_set_size = min([len(data["train"]) for _, data in training_set.items()])
-     
+
+        num_envs = len(training_set)
         # le nombre d'updates (steps) effectués durant une epoch.
-        num_update_steps_per_epoch = math.floor(
-                min_train_set_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size))
+        num_update_steps_per_epoch_per_env = math.floor(
+            min_train_set_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size))
 
         if nb_steps is not None:
+            # Si max_steps est fixé, recalcule num_train_epochs en tenant compte du nombre réel d'updates par époque
+            total_steps_per_epoch = num_update_steps_per_epoch_per_env * num_envs
+            num_train_epochs = max(1, math.ceil(nb_steps / total_steps_per_epoch))
             max_steps = nb_steps
-            num_train_epochs = max(1, math.floor(max_steps / num_update_steps_per_epoch))
         else:
-            max_steps = num_update_steps_per_epoch * num_train_epochs
+            # Si num_train_epochs est fixé, recalcule max_steps
+            total_steps_per_epoch = num_update_steps_per_epoch_per_env * num_envs
+            max_steps = total_steps_per_epoch * num_train_epochs
 
 
         dataloaders, optimizers, lr_schedulers = {}, {}, {}
@@ -135,29 +144,25 @@ class InvariantTrainer(transformers.Trainer):
         total_train_batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
         num_examples = total_train_batch_size * max_steps
 
-        logger.info("***** Running training *****")
-        logger.info(f"  Num examples = {num_examples}")
-        logger.info(f"  Num Epochs = {num_train_epochs}")
-        logger.info(f"  num_update_steps_per_epoch = {num_update_steps_per_epoch}")
-        logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size}")
-        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
-        logger.info(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
-        logger.info(f"  Total optimization steps = {max_steps}")
-
         saving_heads = bool(nb_steps_heads_saving > 0)
         saving_intermediary_models = bool(nb_steps_model_saving > 0)
         total_trained_steps = 0
-        log_interval = 50  # par exemple, log tous les 100 steps
+        log_interval = 5  # par exemple, log tous les 100 steps
 
         print("Num train epoch: ", num_train_epochs)
         print("Batch size: ", total_train_batch_size)
         print("Train data size: ", min_train_set_size)
-        print("num_update_steps_per_epoch: ", num_update_steps_per_epoch)
+        print("num_update_steps_per_epoch_per_env: ", num_update_steps_per_epoch_per_env)
+        print(max_steps)
 
+        best_eval_loss = float('inf')
+
+        stop_training = False
         for epoch in range(int(num_train_epochs)):
-            # Affichage du début de l'époque (en base 1)
-            logger.info(f" Epoch: {epoch}")
-        
+            print("\n" + "="*50)
+            print(f"=== Début de l'Époque {epoch+1} ===")
+            print("="*50 + "\n")
+
             # make all dataloader iterateable
             iter_loaders = {}
             for env_name in training_set.keys():
@@ -168,19 +173,24 @@ class InvariantTrainer(transformers.Trainer):
             epoch_loss_sum = 0.0
             epoch_loss_count = 0
 
-            for _ in tqdm(range(num_update_steps_per_epoch), desc="Training steps"):
-                if total_trained_steps >= max_steps:
-                    break
+            for _ in range(num_update_steps_per_epoch_per_env):
+                print(f"nombre de steps : {total_trained_steps+1}")
 
                 for env_name in training_set.keys():
-                    logger.info(f" Update on environment {env_name}")
+
+                    if total_trained_steps >= max_steps:
+                        stop_training = True
+                        break
+
                     # get a batch
                     optimizer.zero_grad()
                     optimizers[env_name].zero_grad()
 
-                    #self.model.train()
-                    batch = next(iter_loaders[env_name])
-
+                    try:
+                        batch = next(iter_loaders[env_name])
+                    except StopIteration:
+                        iter_loaders[env_name] = iter(dataloaders[env_name])
+                        batch = next(iter_loaders[env_name])
                     # make an update
                     loss = self.training_step(self.model, batch)
                     
@@ -206,8 +216,6 @@ class InvariantTrainer(transformers.Trainer):
                     lr_scheduler.step()
                     lr_schedulers[env_name].step()
 
-                    total_trained_steps += 1
-
                     if saving_heads and total_trained_steps % nb_steps_heads_saving == 0:
                         self.save_heads(total_trained_steps)
                     if saving_intermediary_models and total_trained_steps % nb_steps_model_saving == 0:
@@ -216,17 +224,14 @@ class InvariantTrainer(transformers.Trainer):
                 
                     # [ADDED] After finishing all update steps of the epoch:
                     if total_trained_steps % log_interval == 0:
-                    # Calculate average training loss for the epoch.
+                        # Calcul de la loss moyenne, évaluation, etc.
                         avg_train_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count > 0 else 0.0
 
-                        # Evaluate on the validation set (if available) to compute validation loss and perplexity.
-                        eval_loss = None
-                        perplexity = None
-                        if self.eval_dataset is not None:
-                            eval_metrics = self.evaluate()  # This returns a dict with metrics, including "eval_loss"
-                            eval_loss = eval_metrics.get("eval_loss")
-                            if eval_loss is not None:
-                                perplexity = math.exp(eval_loss)
+                        eval_loss, perplexity = self.run_evaluation()
+
+                        # Définir les chaînes de caractères pour l'affichage
+                        val_str = f"{eval_loss:.4f}" if eval_loss is not None else ""
+                        ppl_str = f"{perplexity:.4f}" if perplexity is not None else ""
 
                         if self.is_world_process_zero():
                             log_path = os.path.join(self.args.output_dir, "training_log.csv")
@@ -239,17 +244,31 @@ class InvariantTrainer(transformers.Trainer):
                                 with open(log_path, "w") as f:
                                     f.write("epoch,global_step,train_loss,val_loss,perplexity\n")
                             with open(log_path, "a") as f:
-                                val_str = f"{eval_loss:.4f}" if eval_loss is not None else ""
-                                ppl_str = f"{perplexity:.4f}" if perplexity is not None else ""
                                 f.write(f"{epoch+1},{total_trained_steps},{avg_train_loss:.4f},{val_str},{ppl_str}\n")
 
-                            # Affichage dans la console
-                            print(f"Step {total_trained_steps} (Epoch {epoch+1}): Train Loss = {avg_train_loss:.4f}, Val Loss = {val_str if eval_loss is not None else 'N/A'}, Perplexity = {ppl_str if perplexity is not None else 'N/A'}")
+                            print("-" * 50)
+                            print(f"Step {total_trained_steps}:")
+                            print(f"  Train Loss = {avg_train_loss:.4f}")
+                            print(f"  Val Loss   = {val_str if eval_loss is not None else 'N/A'}")
+                            print(f"  Perplexity = {ppl_str if perplexity is not None else 'N/A'}")
+                            print("-" * 50)
+
+                        # Sauvegarde du meilleur modèle si la loss d'évaluation est meilleure
+                        if eval_loss is not None and eval_loss < best_eval_loss:
+                            best_eval_loss = eval_loss
+                            best_model_path = os.path.join(self.args.output_dir, "best_model")
+                            self.model.save_pretrained(best_model_path, safe_serialization=False)
+                            print(f"Meilleur modèle sauvegardé à l'étape {total_trained_steps} avec eval_loss = {eval_loss:.4f}")
+
 
                         # Réinitialiser les accumulateurs pour le log d'intervalle
                         epoch_loss_sum = 0.0
                         epoch_loss_count = 0
 
+                    total_trained_steps += 1
+
+                if stop_training:
+                    break
             # Fin d'époque : on peut afficher un résumé si nécessaire
             # (Attention, si l'entraînement s'arrête avant la fin d'une époque, ce résumé risque de couvrir une partie incomplète)
             if epoch_loss_count > 0:
@@ -258,6 +277,8 @@ class InvariantTrainer(transformers.Trainer):
                 avg_epoch_loss = 0.0
             logger.info(f"Fin de l'époque {epoch+1} : Train Loss = {avg_epoch_loss:.4f}")
 
+            if stop_training:
+                    break
 
     def ensemble_train(
             self,
@@ -346,8 +367,13 @@ class InvariantTrainer(transformers.Trainer):
         print("Train data size: ", min_train_set_size)
         print("num_update_steps_per_epoch: ", num_update_steps_per_epoch)
 
+        best_eval_loss = float('inf')
+
         for epoch in range(int(num_train_epochs)):
-            logger.info(f" Epoch: {epoch}")
+            print("\n" + "="*50)
+            print(f"=== Début de l'Époque {epoch+1} ===")
+            print("="*50 + "\n")
+
             # make all dataloader iterateable
             iter_loaders = {}
             for env_name in training_set.keys():
@@ -413,14 +439,10 @@ class InvariantTrainer(transformers.Trainer):
                     # Calculate average training loss for the epoch.
                         avg_train_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count > 0 else 0.0
 
-                        # Evaluate on the validation set (if available) to compute validation loss and perplexity.
-                        eval_loss = None
-                        perplexity = None
-                        if self.eval_dataset is not None:
-                            eval_metrics = self.evaluate()  # This returns a dict with metrics, including "eval_loss"
-                            eval_loss = eval_metrics.get("eval_loss")
-                            if eval_loss is not None:
-                                perplexity = math.exp(eval_loss)
+                        eval_loss, perplexity = self.run_evaluation()
+
+                        val_str = f"{eval_loss:.4f}" if eval_loss is not None else ""
+                        ppl_str = f"{perplexity:.4f}" if perplexity is not None else ""
 
                         if self.is_world_process_zero():
                             log_path = os.path.join(self.args.output_dir, "training_log.csv")
@@ -433,12 +455,21 @@ class InvariantTrainer(transformers.Trainer):
                                 with open(log_path, "w") as f:
                                     f.write("epoch,global_step,train_loss,val_loss,perplexity\n")
                             with open(log_path, "a") as f:
-                                val_str = f"{eval_loss:.4f}" if eval_loss is not None else ""
-                                ppl_str = f"{perplexity:.4f}" if perplexity is not None else ""
                                 f.write(f"{epoch+1},{total_trained_steps},{avg_train_loss:.4f},{val_str},{ppl_str}\n")
 
-                            # Affichage dans la console
-                            print(f"Step {total_trained_steps} (Epoch {epoch+1}): Train Loss = {avg_train_loss:.4f}, Val Loss = {val_str if eval_loss is not None else 'N/A'}, Perplexity = {ppl_str if perplexity is not None else 'N/A'}")
+                            print("-" * 50)
+                            print(f"Step {total_trained_steps} (Époque {epoch+1}):")
+                            print(f"  Train Loss = {avg_train_loss:.4f}")
+                            print(f"  Val Loss   = {val_str if eval_loss is not None else 'N/A'}")
+                            print(f"  Perplexity = {ppl_str if perplexity is not None else 'N/A'}")
+                            print("-" * 50)
+
+                        # Sauvegarde du meilleur modèle si la loss d'évaluation est meilleure
+                        if eval_loss is not None and eval_loss < best_eval_loss:
+                            best_eval_loss = eval_loss
+                            best_model_path = os.path.join(self.args.output_dir, "best_model")
+                            self.model.save_pretrained(best_model_path, safe_serialization=False)
+                            print(f"Meilleur modèle sauvegardé à l'étape {total_trained_steps} avec eval_loss = {eval_loss:.4f}")
 
                         # Réinitialiser les accumulateurs pour le log d'intervalle
                         epoch_loss_sum = 0.0
@@ -531,11 +562,12 @@ class InvariantTrainer(transformers.Trainer):
         print("Train data size: ", min_train_set_size)
         print("num_update_steps_per_epoch: ", num_update_steps_per_epoch)
         
+        best_eval_loss = float('inf')
 
-        for epoch in range(num_train_epochs):
-            
-            # Affichage du début de l'époque (en base 1)
-            logger.info(f" Epoch: {epoch}")
+        for epoch in range(int(num_train_epochs)):
+            print("\n" + "="*50)
+            print(f"=== Début de l'Époque {epoch+1} ===")
+            print("="*50 + "\n")
         
             # make all dataloader iterateable
             iter_loaders = {}
@@ -573,7 +605,6 @@ class InvariantTrainer(transformers.Trainer):
                     epoch_loss_sum += loss.item()
                     epoch_loss_count += 1
 
-
                     if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
                         if hasattr(optimizer, "clip_grad_norm"):
                             # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
@@ -605,14 +636,10 @@ class InvariantTrainer(transformers.Trainer):
                     # Calculate average training loss for the epoch.
                         avg_train_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count > 0 else 0.0
 
-                        # Evaluate on the validation set (if available) to compute validation loss and perplexity.
-                        eval_loss = None
-                        perplexity = None
-                        if self.eval_dataset is not None:
-                            eval_metrics = self.evaluate()  # This returns a dict with metrics, including "eval_loss"
-                            eval_loss = eval_metrics.get("eval_loss")
-                            if eval_loss is not None:
-                                perplexity = math.exp(eval_loss)
+                        eval_loss, perplexity = self.run_evaluation()
+
+                        val_str = f"{eval_loss:.4f}" if eval_loss is not None else ""
+                        ppl_str = f"{perplexity:.4f}" if perplexity is not None else ""
 
                         if self.is_world_process_zero():
                             log_path = os.path.join(self.args.output_dir, "training_log.csv")
@@ -625,12 +652,21 @@ class InvariantTrainer(transformers.Trainer):
                                 with open(log_path, "w") as f:
                                     f.write("epoch,global_step,train_loss,val_loss,perplexity\n")
                             with open(log_path, "a") as f:
-                                val_str = f"{eval_loss:.4f}" if eval_loss is not None else ""
-                                ppl_str = f"{perplexity:.4f}" if perplexity is not None else ""
                                 f.write(f"{epoch+1},{total_trained_steps},{avg_train_loss:.4f},{val_str},{ppl_str}\n")
 
-                            # Affichage dans la console
-                            print(f"Step {total_trained_steps} (Epoch {epoch+1}): Train Loss = {avg_train_loss:.4f}, Val Loss = {val_str if eval_loss is not None else 'N/A'}, Perplexity = {ppl_str if perplexity is not None else 'N/A'}")
+                            print("-" * 50)
+                            print(f"Step {total_trained_steps} (Époque {epoch+1}):")
+                            print(f"  Train Loss = {avg_train_loss:.4f}")
+                            print(f"  Val Loss   = {val_str if eval_loss is not None else 'N/A'}")
+                            print(f"  Perplexity = {ppl_str if perplexity is not None else 'N/A'}")
+                            print("-" * 50)
+
+                        # Sauvegarde du meilleur modèle si la loss d'évaluation est meilleure
+                        if eval_loss is not None and eval_loss < best_eval_loss:
+                            best_eval_loss = eval_loss
+                            best_model_path = os.path.join(self.args.output_dir, "best_model")
+                            self.model.save_pretrained(best_model_path, safe_serialization=False)
+                            print(f"Meilleur modèle sauvegardé à l'étape {total_trained_steps} avec eval_loss = {eval_loss:.4f}")
 
                         # Réinitialiser les accumulateurs pour le log d'intervalle
                         epoch_loss_sum = 0.0
