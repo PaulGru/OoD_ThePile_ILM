@@ -197,13 +197,14 @@ class DataTrainingArguments:
         },
     )
     nb_steps: Optional[int] = field(
-        default=0,
+        default=None,
         metadata={"help": "Number of training steps."},
     )
 
     def __post_init__(self):
-        if self.dataset_name is None and self.train_file is None and self.validation_file is None:
-            raise ValueError("Need either a dataset name or a training/validation file.")
+        if self.train_file is None and self.dataset_name is None:
+            if self.validation_file is None:
+                raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
         # else:
         #     continue
 
@@ -228,6 +229,8 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # Ici, on force l'activation du mode mixed precision (FP16)
+    #training_args.fp16 = True
     nb_steps = data_args.nb_steps
     #training_args.local_rank = -1  # Force explicitement le local_rank à -1 (pas de distributed)
 
@@ -275,54 +278,59 @@ def main():
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
     
+    if training_args.do_train:
 
-    if data_args.train_file is not None:
-        
-        if os.path.isfile(data_args.train_file):
-            # eLM : 1 seul fichier (all_train.txt)
-            data_files = {"train": data_args.train_file}
-            dataset = load_dataset("text", data_files=data_files)
-            irm_datasets = {"all": dataset}
-            #envs_list = ["all"]
+        if data_args.train_file is not None:
+            if os.path.isfile(data_args.train_file):
+                # eLM : 1 seul fichier (all_train.txt)
+                data_files = {"train": data_args.train_file}
+                dataset = load_dataset("text", data_files=data_files)
+                irm_datasets = {"all_train": dataset}
+            
+            else:
+                # Cas multi-environnements : plusieurs fichiers dans un dossier
+                irm_folder = data_args.train_file
+                irm_datasets = {}
+                for file in os.listdir(irm_folder):
+                    if file.endswith('.txt'):
+                        env_name = file.split(".")[0]
+                        if env_name.startswith("val_"):
+                            continue
+                        data_files = {"train": os.path.join(irm_folder, file)}
+                        datasets = load_dataset("text", data_files=data_files)
+                        irm_datasets[env_name] = datasets
+
+        elif data_args.dataset_name is not None:
+            train_dataset = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split="train",
+            )
+            irm_datasets = {"train": train_dataset}
         
         else:
-            # Cas multi-environnements : plusieurs fichiers dans un dossier
-            irm_folder = data_args.train_file
-            irm_datasets = {}
-            for file in os.listdir(irm_folder):
-                if file.endswith('.txt'):
-                    env_name = file.split(".")[0]
-                    if env_name.startswith("val_"):
-                        continue
-                    data_files = {"train": os.path.join(irm_folder, file)}
-                    #data_files = {}
-                    #data_files["train"] = os.path.join(irm_folder, file)
-                    datasets = load_dataset("text", data_files=data_files)
-                    irm_datasets[env_name] = datasets
-                #envs_list = list(irm_datasets.keys())
+            raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
+        
+        # Si un fichier de validation est fourni, chargez-le et ajoutez-le avec la clé "validation-file"
+        if data_args.validation_file is not None:
+            val_data_files = {"validation": data_args.validation_file}
+            val_dataset = load_dataset("text", data_files=val_data_files)
+            irm_datasets["validation-file"] = val_dataset
 
-
-    elif data_args.dataset_name is not None:
-            
-        # Charger le dataset directement depuis Hugging Face
-        train_dataset = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split="train",
-            # streaming=True  # Optionnel : utile si le dataset est très volumineux
-        )
-
-        irm_datasets = {"train": train_dataset}
-        #envs_list = ["train"]
+        envs = [k for k in irm_datasets.keys() if 'validation-file' not in k]
 
     else:
-        raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
 
-    if data_args.validation_file is not None:
-        data_files = {}
-        data_files["validation"] = data_args.validation_file
-        eval_datasets = load_dataset("text", data_files=data_files)
-        irm_datasets['validation-file'] = eval_datasets
+        if data_args.validation_file is not None:
+            data_files = {"validation": data_args.validation_file}
+            eval_datasets = load_dataset("text", data_files=data_files)
+            irm_datasets = {"validation-file": eval_datasets}
+            #irm_datasets['validation-file'] = eval_datasets
+            # Pour l'évaluation, on définit envs comme une liste avec un seul environnement.
+            envs = ["validation-file"]
+        
+        else:
+            raise ValueError("Aucun fichier de validation n'est spécifié pour l'évaluation.")
 
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
@@ -332,6 +340,7 @@ def main():
         "revision": model_args.model_revision,
         "use_auth_token": True if model_args.use_auth_token else None,
     }
+
     if model_args.config_name:
         config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
     elif model_args.model_name_or_path:
@@ -339,9 +348,6 @@ def main():
     else:
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
-    
-
-    #config.envs = envs_list
 
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -375,8 +381,6 @@ def main():
     model.config.dropout = 0.25
     model.config.attention_dropout = 0.25
 
-
-    envs = [k for k in irm_datasets.keys() if 'validation' not in k]
 
     if len(envs) > 1:
         # Plusieurs environnements : on souhaite utiliser iLM, mtLM ou ensLM avec multi-têtes.
@@ -509,9 +513,16 @@ def main():
     # Data collator
     # This one will take care of randomly masking the tokens.
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=data_args.mlm_probability)
-
+    
+    print("Clés d'irm_tokenized_datasets :", list(irm_tokenized_datasets.keys()))
+    
     train_tokenized_datasets = {k: v for k, v in irm_tokenized_datasets.items() if not('validation-file' in k)}
     eval_tokenized_datasets = irm_tokenized_datasets['validation-file']['validation']
+
+    print(len(train_tokenized_datasets))
+    #print(train_tokenized_datasets.keys())
+    print(len(eval_tokenized_datasets))
+    #print(eval_tokenized_datasets.keys())
 
     # Initialize our Trainer
     trainer = InvariantTrainer(
@@ -566,13 +577,18 @@ def main():
     # Evaluation
     results = {}
     if training_args.do_eval:
-        logger.info("*** Evaluate ***")
 
+        logger.info("*** Evaluate ***")
         eval_output = trainer.evaluate()
 
-        perplexity = math.exp(eval_output["eval_loss"])
-        results["perplexity"] = perplexity
+        eval_loss = eval_output["eval_loss"]
+        perplexity = math.exp(eval_loss) if eval_loss is not None else float('inf')
+        results = {"perplexity": perplexity}
+        print("***** Eval results *****")
+        for key, value in sorted(results.items()):
+            print(f"{key} = {value:.4f}")
 
+        # Ensuite, les résultats sont aussi sauvegardés dans le fichier eval_results_mlm.txt
         output_eval_file = os.path.join(training_args.output_dir, "eval_results_mlm.txt")
         if trainer.is_world_process_zero():
             with open(output_eval_file, "w") as writer:
