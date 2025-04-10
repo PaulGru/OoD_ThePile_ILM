@@ -29,6 +29,14 @@ def count_tokens(example):
 train_dataset = train_dataset.map(count_tokens, batched=False)
 test_dataset = test_dataset.map(count_tokens, batched=False)
 
+# Calculer le poids brut (en octets) de chaque exemple : 
+# On encode le texte en UTF-8 et on calcule la longueur.
+def compute_raw_weight(example):
+    return {"raw_weight": len(example["text"].encode("utf-8"))}
+
+train_dataset = train_dataset.map(compute_raw_weight, batched=False)
+test_dataset = test_dataset.map(compute_raw_weight, batched=False)
+
 # Récupérer la liste unique des environnements depuis le train
 environments = list(set(train_dataset["environment"]))
 print("Environnements trouvés dans le train :", environments)
@@ -43,7 +51,10 @@ print("Environnements OoD :", ood_envs)
 
 # Créer un dossier pour sauvegarder les fichiers
 output_folder = "small_the_pile_env"
-os.makedirs(output_folder, exist_ok=True)
+train_folder = os.path.join(output_folder, "train_env")
+val_folder = os.path.join(output_folder, "val_env")
+os.makedirs(train_folder, exist_ok=True)
+os.makedirs(val_folder, exist_ok=True)
 
 def write_dataset_to_file(dataset, filename):
     with open(filename, "w", encoding="utf-8") as f:
@@ -58,6 +69,12 @@ for env in train_envs:
     write_dataset_to_file(subset, output_file)
     print(f"Fichier d'entraînement pour '{env}' créé avec {len(subset)} exemples.")
 
+# Création du fichier combiné pour eLM dans le dossier train (facultatif)
+all_train_subset = train_dataset.filter(lambda x: x["environment"] in train_envs)
+all_train_file = os.path.join(train_folder, "all_train.txt")
+write_dataset_to_file(all_train_subset, all_train_file)
+print(f"Fichier combiné 'all_train.txt' créé avec {len(all_train_subset)} exemples.")
+
 # Pour la validation, utiliser directement le split test en le filtrant :
 # - Validation InD : les exemples du test appartenant aux environnements InD
 # - Validation OoD : les exemples du test appartenant aux environnements OoD
@@ -65,8 +82,8 @@ for env in train_envs:
 val_ind = test_dataset.filter(lambda x: x["environment"] in train_envs)
 val_ood = test_dataset.filter(lambda x: x["environment"] in ood_envs)
 
-val_ind_file = os.path.join(output_folder, "val_ind.txt")
-val_ood_file = os.path.join(output_folder, "val_ood.txt")
+val_ind_file = os.path.join(val_folder, "val_ind.txt")
+val_ood_file = os.path.join(val_folder, "val_ood.txt")
 write_dataset_to_file(val_ind, val_ind_file)
 write_dataset_to_file(val_ood, val_ood_file)
 
@@ -76,21 +93,18 @@ print(f"Validation OoD créée avec {len(val_ood)} exemples.")
 # Affichage des statistiques pour le train (par environnement)
 total_train_examples = len(train_dataset)
 total_train_tokens = sum(train_dataset["token_count"])
+total_train_raw_weight = sum(train_dataset["raw_weight"])
 
 print("\nStatistiques par environnement dans le train:")
 for env in environments:
     env_subset = train_dataset.filter(lambda x: x["environment"] == env)
     num_examples = len(env_subset)
     total_tokens_env = sum(env_subset["token_count"])
+    total_raw_weight_env = sum(env_subset["raw_weight"])
     pct_examples = 100 * num_examples / total_train_examples
     pct_tokens = 100 * total_tokens_env / total_train_tokens
+    pct_raw_weight = 100 * total_raw_weight_env / total_train_raw_weight
     print(f"Environnement: {env}")
     print(f"  Exemples: {num_examples} ({pct_examples:.2f}% du total)")
     print(f"  Tokens: {total_tokens_env} ({pct_tokens:.2f}% du total)")
-
-# Création du fichier combiné pour eLM après avoir généré tous les fichiers d'environnements
-all_train = train_dataset.filter(lambda x: x["environment"] in train_envs)
-output_file = os.path.join(output_folder, "all_train.txt")
-write_dataset_to_file(all_train, output_file)
-print(f"Fichier combiné 'all_train.txt' créé avec {len(all_train)} exemples.")
-
+    print(f"  Poids brut (octets) : {total_raw_weight_env} ({pct_raw_weight:.2f}% du total)")
