@@ -9,6 +9,7 @@ split_datasets = full_dataset.train_test_split(test_size=0.2, seed=42)
 train_dataset = split_datasets["train"]  # Pour l'entraînement
 test_dataset = split_datasets["test"]    # Pour l'évaluation (validation InD et OoD)
 
+print(f"Nombre d'exemples total dans full_dataset : {len(full_dataset)}")
 print(f"Nombre d'exemples train: {len(train_dataset)}")
 print(f"Nombre d'exemples test: {len(test_dataset)}")
 
@@ -19,6 +20,7 @@ def extract_environment(example):
 
 train_dataset = train_dataset.map(extract_environment)
 test_dataset = test_dataset.map(extract_environment)
+
 
 # Compter le nombre de tokens via DistilBertTokenizerFast
 tokenizer = DistilBertTokenizerFast.from_pretrained("distilbert-base-uncased")
@@ -39,13 +41,34 @@ test_dataset = test_dataset.map(compute_raw_weight, batched=False)
 
 # Récupérer la liste unique des environnements depuis le train
 environments = list(set(train_dataset["environment"]))
-print("Environnements trouvés dans le train :", environments)
+print("Liste des environnements :", environments)
 
-# Définir InD et OoD à partir des environnements du train
-random.shuffle(environments)
-num_train_env = int(0.6 * len(environments))
-train_envs = environments[:num_train_env]
-ood_envs = environments[num_train_env:]
+
+# Utiliser des listes fixes pour définir les environnements d'entraînement (InD) et de test (OoD)
+train_envs = [ 
+    "HackerNews",
+    "StackExchange",
+    "USPTO Backgrounds",
+    "Wikipedia (en)",
+    "Pile-CC",
+    "DM Mathematics",
+    "YoutubeSubtitles",
+    "EuroParl",
+    "ArXiv",
+    "Books3",
+    "FreeLaw"
+]
+
+ood_envs = [ 
+    "Enron Emails",
+    "OpenWebText2",
+    "PubMed Abstracts",
+    "Github",
+    "Ubuntu IRC",
+    "PubMed Central",
+    "Gutenberg (PG-19)",
+]
+
 print("Environnements InD :", train_envs)
 print("Environnements OoD :", ood_envs)
 

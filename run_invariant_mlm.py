@@ -212,7 +212,7 @@ def main():
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
         
     nb_steps = data_args.nb_steps
-    training_args.local_rank = -1
+    #training_args.local_rank = -1
 
     # Force local_rank à -1 si non défini (on n'utilise pas le training distribué)
     #if training_args.local_rank is None:
@@ -273,7 +273,9 @@ def main():
         if model_args.mode == "eLM":
             envs = list(train_datasets.keys())
     else:
-        train_datasets = None
+        train_datasets = {}
+        # Mode évaluation uniquement ; définir envs à une valeur par défaut.
+        envs = []  # ou éventuellement envs = ['default'] si votre modèle en a besoin
 
     # Chargement de la validation depuis le dossier "val_env"
     if training_args.do_eval:
@@ -360,13 +362,12 @@ def main():
         irm_model = model
 
     irm_model.resize_token_embeddings(len(tokenizer))
-    print("Liste des environnements pour l'entraînement (envs) :", envs)
 
 
     # AJOUT : enregistrement des hooks de débogage pour identifier les NaNs
-    from hooks import register_nan_forward_hooks, register_nan_backward_hooks
-    register_nan_forward_hooks(irm_model)
-    register_nan_backward_hooks(irm_model)
+    #from hooks import register_nan_forward_hooks, register_nan_backward_hooks
+    #register_nan_forward_hooks(irm_model)
+    #register_nan_backward_hooks(irm_model)
 
     # Pré-traitement des datasets d'entraînement : tokenisation et regroupement.
     irm_tokenized_train = {}
@@ -460,7 +461,6 @@ def main():
             train_result = trainer.multitask_train(
                 training_set=irm_tokenized_train,
                 nb_steps=nb_steps,
-                nb_steps_heads_saving=model_args.nb_steps_heads_saving,
                 nb_steps_model_saving=model_args.nb_steps_model_saving,
                 num_train_epochs=training_args.num_train_epochs,
             )
@@ -484,7 +484,7 @@ def main():
         
         output_dir = training_args.output_dir
         trainer.model.save_pretrained(output_dir, safe_serialization=False)
-        trainer.tokenizer.save_pretrained(output_dir)
+        trainer.processing_class.save_pretrained(output_dir)
         
         output_train_file = os.path.join(training_args.output_dir, "train_results.txt")
         if trainer.is_world_process_zero():
@@ -503,6 +503,7 @@ def main():
         #results = {"perplexity": perplexity}
 
         from torch.utils.data import DataLoader
+        from tqdm import tqdm 
 
         # Création du DataLoader pour l'évaluation. On utilise ici la taille de batch définie pour l'évaluation.
         eval_dataloader = DataLoader(
@@ -518,15 +519,19 @@ def main():
 
         # Boucle d'évaluation avec torch.no_grad() et AMP
         with torch.no_grad():
-            for batch in eval_dataloader:
+            pbar = tqdm(eval_dataloader, desc="Évaluation", unit="batch")
+            for batch in pbar:
                 # Déplacement des tensors sur le device
                 batch = {k: v.to(training_args.device) for k, v in batch.items()}
                 # Calcul en mode AMP
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast("cuda"):
                     outputs = irm_model(**batch)
                     loss = outputs.loss
-                    total_eval_loss += loss.item()
+                total_eval_loss += loss.item()
                 nb_eval_steps += 1
+                # Mise à jour de la barre de progression avec la loss du batch courant
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
+
 
         # Calcul de la loss moyenne et de la perplexité
         avg_eval_loss = total_eval_loss / nb_eval_steps if nb_eval_steps > 0 else 0.0

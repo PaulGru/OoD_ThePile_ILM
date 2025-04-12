@@ -82,207 +82,6 @@ class InvariantTrainer(transformers.Trainer):
         return eval_loss, perplexity
 
 
-    def invariant_trainn(
-            self,
-            training_set,
-            nb_steps: Optional[int] = None,
-            nb_steps_heads_saving: Optional[int] = 0,
-            num_train_epochs: Optional[int] = 1,
-            nb_steps_model_saving: Optional[int] = 0,
-            **kwargs,
-    ):
-        if nb_steps is None and num_train_epochs is None:
-            raise ValueError("Both nb_steps and num_train_epochs can't be None at the same time")
-
-        if len(kwargs) > 0:
-            raise TypeError(f"train() received got unexpected keyword arguments: {', '.join(list(kwargs.keys()))}.")
-
-        min_train_set_size = min([len(data["train"]) for _, data in training_set.items()])
-
-        num_envs = len(training_set)
-        # le nombre d'updates (steps) effectués durant une epoch.
-        num_update_steps_per_epoch_per_env = math.floor(
-            min_train_set_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size))
-
-        if nb_steps is not None:
-            # Si max_steps est fixé, recalcule num_train_epochs en tenant compte du nombre réel d'updates par époque
-            total_steps_per_epoch = num_update_steps_per_epoch_per_env * num_envs
-            num_train_epochs = max(1, math.ceil(nb_steps / total_steps_per_epoch))
-            max_steps = nb_steps
-        else:
-            # Si num_train_epochs est fixé, recalcule max_steps
-            total_steps_per_epoch = num_update_steps_per_epoch_per_env * num_envs
-            max_steps = total_steps_per_epoch * num_train_epochs
-
-        dataloaders, optimizers, lr_schedulers = {}, {}, {}
-        for env_name, data_features in training_set.items():
-            dataloaders[env_name] = self.get_single_train_dataloader(env_name, data_features["train"])
-            if hasattr(self.model, "lm_heads"):
-                optimizer, lr_scheduler = self.create_optimizer_and_scheduler(self.model.lm_heads[env_name],
-                                                                          num_training_steps=max_steps)
-            else:
-                optimizer, lr_scheduler = self.create_optimizer_and_scheduler(self.model, num_training_steps=max_steps)
-            
-            optimizers[env_name] = optimizer
-            lr_schedulers[env_name] = lr_scheduler
-
-        if hasattr(self.model, 'encoder'):
-            shared_encoder = self.model.encoder
-        elif hasattr(self.model, 'distilbert'):
-            shared_encoder = self.model.distilbert
-        else:
-            raise AttributeError("The model does not have an encoder attribute.")
-        optimizer, lr_scheduler = self.create_optimizer_and_scheduler(shared_encoder, num_training_steps=max_steps)
-
-        self.state = TrainerState()
-        if self.args.n_gpu > 0:
-            self.model.to(self.args.device)
-        if self.args.n_gpu >  1:
-            self.model = torch.nn.DataParallel(self.model)
-
-        total_train_batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
-        num_examples = total_train_batch_size * max_steps
-
-        saving_heads = bool(nb_steps_heads_saving > 0)
-        saving_intermediary_models = bool(nb_steps_model_saving > 0)
-        total_trained_steps = 0
-        log_interval = 5  # par exemple, log tous les 100 steps
-
-        print("Num train epoch: ", num_train_epochs)
-        print("Batch size: ", total_train_batch_size)
-        print("Train data size: ", min_train_set_size)
-        print("num_update_steps_per_epoch_per_env: ", num_update_steps_per_epoch_per_env)
-        print(max_steps)
-
-        best_eval_loss = float('inf')
-
-        stop_training = False
-        for epoch in range(int(num_train_epochs)):
-            print("\n" + "="*50)
-            print(f"=== Début de l'Époque {epoch+1} ===")
-            print("="*50 + "\n")
-
-            # make all dataloader iterateable
-            iter_loaders = {}
-            for env_name in training_set.keys():
-                train_loader = dataloaders[env_name]
-                iter_loaders[env_name] = iter(train_loader)
-
-            # [ADDED] Initialize accumulators for the epoch's training loss
-            epoch_loss_sum = 0.0
-            epoch_loss_count = 0
-
-            for _ in range(num_update_steps_per_epoch_per_env):
-                print(f"nombre de steps : {total_trained_steps+1}")
-
-                for env_name in training_set.keys():
-
-                    if total_trained_steps >= max_steps:
-                        stop_training = True
-                        break
-
-                    # get a batch
-                    optimizer.zero_grad()
-                    optimizers[env_name].zero_grad()
-
-                    try:
-                        batch = next(iter_loaders[env_name])
-                    except StopIteration:
-                        iter_loaders[env_name] = iter(dataloaders[env_name])
-                        batch = next(iter_loaders[env_name])
-
-                    #with torch.amp.autocast("cuda", enabled=False):
-                    loss = self.training_step(self.model, batch)
-                   
-                    # [ADDED] Accumulate the training loss for logging
-                    epoch_loss_sum += loss.item()
-                    epoch_loss_count += 1
-
-                    if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
-                        if hasattr(optimizer, "clip_grad_norm"):
-                            # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
-                            optimizer.clip_grad_norm(self.args.max_grad_norm)
-                            optimizers[env_name].clip_grad_norm(self.args.max_grad_norm)
-                        else:
-                            # Revert to normal clipping otherwise, handling Apex or full precision
-                            torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(),
-                                self.args.max_grad_norm,
-                            )
-                    
-                    # Mise à jour des optimisateurs
-                    optimizer.step()
-                    optimizers[env_name].step()
-
-                    lr_scheduler.step()
-                    lr_schedulers[env_name].step()
-
-                    if saving_heads and total_trained_steps % nb_steps_heads_saving == 0:
-                        self.save_heads(total_trained_steps)
-                    if saving_intermediary_models and total_trained_steps % nb_steps_model_saving == 0:
-                        self.save_intermediary_model(total_trained_steps)
-        
-                
-                    # [ADDED] After finishing all update steps of the epoch:
-                    if total_trained_steps % log_interval == 0:
-                        # Calcul de la loss moyenne, évaluation, etc.
-                        avg_train_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count > 0 else 0.0
-
-                        eval_loss, perplexity = self.run_evaluation()
-
-                        # Définir les chaînes de caractères pour l'affichage
-                        val_str = f"{eval_loss:.4f}" if eval_loss is not None else ""
-                        ppl_str = f"{perplexity:.4f}" if perplexity is not None else ""
-
-                        if self.is_world_process_zero():
-                            log_path = os.path.join(self.args.output_dir, "training_log.csv")
-                            
-                            if total_trained_steps == log_interval and os.path.exists(log_path):
-                                os.remove(log_path)
-
-                            # On first evaluation, write header if file doesn't exist
-                            if total_trained_steps == log_interval and not os.path.exists(log_path):
-                                with open(log_path, "w") as f:
-                                    f.write("epoch,global_step,train_loss,val_loss,perplexity\n")
-                            with open(log_path, "a") as f:
-                                f.write(f"{epoch+1},{total_trained_steps},{avg_train_loss:.4f},{val_str},{ppl_str}\n")
-
-                            print("-" * 50)
-                            print(f"Step {total_trained_steps}:")
-                            print(f"  Train Loss = {avg_train_loss:.4f}")
-                            print(f"  Val Loss   = {val_str if eval_loss is not None else 'N/A'}")
-                            print(f"  Perplexity = {ppl_str if perplexity is not None else 'N/A'}")
-                            print("-" * 50)
-
-                        # Sauvegarde du meilleur modèle si la loss d'évaluation est meilleure
-                        if eval_loss is not None and eval_loss < best_eval_loss:
-                            best_eval_loss = eval_loss
-                            best_model_path = os.path.join(self.args.output_dir, "best_model")
-                            self.model.save_pretrained(best_model_path, safe_serialization=False)
-                            print(f"Meilleur modèle sauvegardé à l'étape {total_trained_steps} avec eval_loss = {eval_loss:.4f}")
-
-
-                        # Réinitialiser les accumulateurs pour le log d'intervalle
-                        epoch_loss_sum = 0.0
-                        epoch_loss_count = 0
-
-                    total_trained_steps += 1
-
-                if stop_training:
-                    break
-            # Fin d'époque : on peut afficher un résumé si nécessaire
-            # (Attention, si l'entraînement s'arrête avant la fin d'une époque, ce résumé risque de couvrir une partie incomplète)
-            if epoch_loss_count > 0:
-                avg_epoch_loss = epoch_loss_sum / epoch_loss_count
-            else:
-                avg_epoch_loss = 0.0
-            logger.info(f"Fin de l'époque {epoch+1} : Train Loss = {avg_epoch_loss:.4f}")
-
-            if stop_training:
-                    break
-
-
-
     def invariant_train(
             self,
             training_set,
@@ -299,6 +98,7 @@ class InvariantTrainer(transformers.Trainer):
             raise TypeError(f"train() received got unexpected keyword arguments: {', '.join(list(kwargs.keys()))}.")
 
         min_train_set_size = min([len(data["train"]) for _, data in training_set.items()])
+        
         num_envs = len(training_set)
         # Calcul du nombre d'updates (steps) effectués durant une epoch pour chaque environnement
         num_rounds_per_epoch = math.floor(
@@ -346,6 +146,7 @@ class InvariantTrainer(transformers.Trainer):
 
         total_train_batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
         print("Nombre total d'exemples traités approximativement :", total_train_batch_size * max_steps)
+        print(min_train_set_size)
 
         saving_heads = bool(nb_steps_heads_saving > 0)
         saving_intermediary_models = bool(nb_steps_model_saving > 0)
@@ -442,7 +243,6 @@ class InvariantTrainer(transformers.Trainer):
 
                 print(f"----- Fin du round {round_idx + 1}/{num_rounds_per_epoch}: Loss moyenne sur ce round = {avg_round_loss:.4f} -----\n")
 
-
                 # Logging et évaluation périodique
                 if total_trained_steps % log_interval == 0:
                     eval_loss, perplexity = self.run_evaluation()
@@ -484,19 +284,6 @@ class InvariantTrainer(transformers.Trainer):
             nb_steps_model_saving: Optional[int] = 0,
             **kwargs,
     ):
-        """
-        Training the heads as en ensemble instead of following the IRM-games dynamic
-
-        Args:
-            nb_steps : permet de contrôler directement le nombre de optimizer.step() qui sont réalisés.
-            num_train_epochs : nombre d'epochs d'entraînement à faire.
-            trial (:obj:`optuna.Trial` or :obj:`Dict[str, Any]`, `optional`):
-                The trial run or the hyperparameter dictionary for hyperparameter search.
-            kwargs:
-                Additional keyword arguments used to hide deprecated arguments
-        """
-    
-
         if nb_steps is None and num_train_epochs is None:
             raise ValueError("Both nb_steps and num_train_epochs can't be None at the same time")
 
@@ -505,25 +292,34 @@ class InvariantTrainer(transformers.Trainer):
 
         min_train_set_size = min([len(data["train"]) for _, data in training_set.items()])
 
+        num_envs = len(training_set)
         # le nombre d'updates (steps) effectués durant une epoch.
-        num_update_steps_per_epoch = math.floor(
+        num_rounds_per_epoch = math.floor(
                 min_train_set_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size))
 
         if nb_steps is not None:
+            total_steps_per_epoch = num_rounds_per_epoch * num_envs
+            num_train_epochs = max(1, math.ceil(nb_steps / total_steps_per_epoch))
             max_steps = nb_steps
-            num_train_epochs = max(1, math.floor(max_steps / num_update_steps_per_epoch))
-        
-        # Si on ne spécifie pas nb_steps, alors num_train_epochs détermine combien de fois on parcourt les données.
         else:
-            max_steps = num_update_steps_per_epoch * num_train_epochs
+            total_steps_per_epoch = num_rounds_per_epoch * num_envs
+            max_steps = total_steps_per_epoch * num_train_epochs
 
         dataloaders, optimizers, lr_schedulers = {}, {}, {}
         for env_name, data_features in training_set.items():
+            
             dataloaders[env_name] = self.get_single_train_dataloader(env_name, data_features["train"])
-            optimizer, lr_scheduler = self.create_optimizer_and_scheduler(self.model.lm_heads[env_name],
-                                                                        num_training_steps=max_steps)
-            optimizers[env_name] = optimizer
-            lr_schedulers[env_name] = lr_scheduler
+            if hasattr(self.model, "lm_heads"):
+                optimizer_env, lr_scheduler_env = self.create_optimizer_and_scheduler(
+                    self.model.lm_heads[env_name],
+                    num_training_steps=max_steps
+                )
+            else:
+                optimizer_env, lr_scheduler_env = self.create_optimizer_and_scheduler(
+                    self.model, num_training_steps=max_steps
+                )
+            optimizers[env_name] = optimizer_env
+            lr_schedulers[env_name] = lr_scheduler_env
 
         if hasattr(self.model, 'encoder'):
             shared_encoder = self.model.encoder
@@ -534,149 +330,140 @@ class InvariantTrainer(transformers.Trainer):
         optimizer, lr_scheduler = self.create_optimizer_and_scheduler(shared_encoder, num_training_steps=max_steps)
 
         self.state = TrainerState()
-
         if self.args.n_gpu > 0:
             self.model.to(self.args.device)
         if self.args.n_gpu >  1:
             self.model = torch.nn.DataParallel(self.model)
         
         total_train_batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
-        num_examples = total_train_batch_size * max_steps # nombre total d'exemples vu durant l'entraînement.
-
-        logger.info("***** Running training *****")
-        logger.info(f"  Num examples = {num_examples}")
-        logger.info(f"  Num Epochs = {num_train_epochs}")
-        logger.info(f"  num_update_steps_per_epoch = {num_update_steps_per_epoch}")
-        logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size}")
-        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
-        logger.info(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
-        logger.info(f"  Total optimization steps = {max_steps}")
+        print("Nombre total d'exemples traités approximativement :", total_train_batch_size * max_steps)
+        print(min_train_set_size)
 
         saving_heads = bool(nb_steps_heads_saving > 0)
         saving_intermediary_models = bool(nb_steps_model_saving > 0)
         total_trained_steps = 0
-        log_interval = 50
-
-        print("Num train epoch: ", num_train_epochs)
-        print("Batch size: ", total_train_batch_size)
-        print("Train data size: ", min_train_set_size)
-        print("num_update_steps_per_epoch: ", num_update_steps_per_epoch)
+        log_interval = 5
 
         best_eval_loss = float('inf')
+        stop_training = False
 
+        # Initialisation du scaler pour AMP
+        scaler = torch.amp.GradScaler("cuda")
+        
         for epoch in range(int(num_train_epochs)):
-            print("\n" + "="*50)
-            print(f"=== Début de l'Époque {epoch+1} ===")
-            print("="*50 + "\n")
+            print("\n" + "=" * 70)
+            print(f"===== DÉBUT DE L'ÉPOQUE {epoch + 1}/{num_train_epochs} =====")
+            print("=" * 70 + "\n")
 
             # make all dataloader iterateable
             iter_loaders = {}
             for env_name in training_set.keys():
                 train_loader = dataloaders[env_name]
                 iter_loaders[env_name] = iter(train_loader)
-            
-            epoch_loss_sum = 0.0
-            epoch_loss_count = 0
 
-            for _ in tqdm(range(num_update_steps_per_epoch), desc="Training steps"):
-                if total_trained_steps >= max_steps:
-                    break
+            for round_idx in range(num_rounds_per_epoch):
+                round_loss_sum = 0.0
+                round_loss_count = 0
+
+                print(f"----- Début du round {round_idx + 1}/{num_rounds_per_epoch} : Mise à jour de tous les environnements -----")
 
                 for env_name in training_set.keys():
-                    logger.info(f" Update on environement {env_name}")
-                    # get a batch
+                    if total_trained_steps >= max_steps:
+                        stop_training = True
+                        break
+                    
+                    print(f"[Step {total_trained_steps + 1}] Entraînement sur l'environnement : {env_name}")
+
                     optimizer.zero_grad()
                     for e_n in training_set.keys():
                         optimizers[e_n].zero_grad()
 
-                    batch = next(iter_loaders[env_name])
+                    try:
+                        batch = next(iter_loaders[env_name])
+                    except StopIteration:
+                        iter_loaders[env_name] = iter(dataloaders[env_name])
+                        batch = next(iter_loaders[env_name])
 
-                    # loss.backward() is done inside training step
-                    loss = self.training_step(self.model, batch)
+                    # On s'assure que la batch est sur le bon device
+                    batch = {k: v.to(self.args.device) for k, v in batch.items()}
 
-                    epoch_loss_sum += loss.item()
-                    epoch_loss_count += 1
+                    self.model.train()
+                    # Calcul du forward en AMP
+                    with torch.amp.autocast("cuda"):               
+                        outputs = self.model(**batch)
+                        loss = outputs.loss
+
+                    # Accumulation de la loss pour le reporting
+                    step_loss = loss.item()
+                    round_loss_sum += step_loss
+                    round_loss_count += 1
+                    print(f"    Loss pour l'environnement {env_name}: {step_loss:.4f}")
+
+                    # Rétropropagation avec AMP
+                    scaler.scale(loss).backward()
 
                     if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
 
-                        if hasattr(optimizer, "clip_grad_norm"):
-                            # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
-                            optimizer.clip_grad_norm(self.args.max_grad_norm)
-                            for e_n in training_set.keys():
-                                optimizers[e_n].clip_grad_norm(self.args.max_grad_norm)
-                        else:
-                            # Revert to normal clipping otherwise, handling Apex or full precision
-                            torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(),
-                                self.args.max_grad_norm,
-                            )
+                        scaler.unscale_(optimizer)
+                        for e_n in training_set.keys():
+                            scaler.unscale_(optimizers[e_n])
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
 
-                
-                    optimizer.step()
+                    scaler.step(optimizer)
                     for e_n in training_set.keys():
-                        optimizers[e_n].step()
+                        scaler.step(optimizers[e_n])
+                    scaler.update()
 
                     lr_scheduler.step()
                     for e_n in training_set.keys():
                         lr_schedulers[e_n].step()
 
+                    print(f"    Fin d'update sur l'environnement {env_name}.")
+
                     total_trained_steps += 1
                     
-                    if saving_heads:
-                        if total_trained_steps % nb_steps_heads_saving == 0:
-                            self.save_heads(total_trained_steps)
-                    if saving_intermediary_models:
-                        if total_trained_steps % nb_steps_model_saving == 0:
-                            self.save_intermediary_model(total_trained_steps)
+                    # Sauvegardes éventuelles
+                    if saving_heads and total_trained_steps % nb_steps_heads_saving == 0:
+                        self.save_heads(total_trained_steps)
+                    if saving_intermediary_models and total_trained_steps % nb_steps_model_saving == 0:
+                        self.save_intermediary_model(total_trained_steps)
                     
+                    if stop_training:
+                        break
+                
+                if round_loss_count > 0:
+                    avg_round_loss = round_loss_sum / round_loss_count
+                else:
+                    avg_round_loss = 0.0
 
-                    if total_trained_steps % log_interval == 0:
-                    # Calculate average training loss for the epoch.
-                        avg_train_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count > 0 else 0.0
+                print(f"----- Fin du round {round_idx + 1}/{num_rounds_per_epoch}: Loss moyenne sur ce round = {avg_round_loss:.4f} -----\n")
 
-                        eval_loss, perplexity = self.run_evaluation()
+                if total_trained_steps % log_interval == 0:
+                    eval_loss, perplexity = self.run_evaluation()
+                    if self.is_world_process_zero():
+                        log_path = os.path.join(self.args.output_dir, "training_log.csv")
+                        if total_trained_steps == log_interval and os.path.exists(log_path):
+                            os.remove(log_path)
+                        if total_trained_steps == log_interval and not os.path.exists(log_path):
+                            with open(log_path, "w") as f:
+                                f.write("epoch,global_step,train_loss,val_loss,perplexity\n")
+                        with open(log_path, "a") as f:
+                            f.write(f"{epoch+1},{total_trained_steps},{avg_round_loss:.4f},{eval_loss:.4f},{perplexity:.4f}\n")
 
-                        val_str = f"{eval_loss:.4f}" if eval_loss is not None else ""
-                        ppl_str = f"{perplexity:.4f}" if perplexity is not None else ""
+                    # Sauvegarde du meilleur modèle si la loss d'évaluation est meilleure
+                    if eval_loss is not None and eval_loss < best_eval_loss:
+                        best_eval_loss = eval_loss
+                        best_model_path = os.path.join(self.args.output_dir, "best_model")
+                        self.model.save_pretrained(best_model_path, safe_serialization=False)
+                        print(f"Meilleur modèle sauvegardé à l'étape {total_trained_steps} avec eval_loss = {eval_loss:.4f}")
 
-                        if self.is_world_process_zero():
-                            log_path = os.path.join(self.args.output_dir, "training_log.csv")
-                            
-                            if total_trained_steps == log_interval and os.path.exists(log_path):
-                                os.remove(log_path)
+                if stop_training:
+                    break
 
-                            # On first evaluation, write header if file doesn't exist
-                            if total_trained_steps == log_interval and not os.path.exists(log_path):
-                                with open(log_path, "w") as f:
-                                    f.write("epoch,global_step,train_loss,val_loss,perplexity\n")
-                            with open(log_path, "a") as f:
-                                f.write(f"{epoch+1},{total_trained_steps},{avg_train_loss:.4f},{val_str},{ppl_str}\n")
-
-                            print("-" * 50)
-                            print(f"Step {total_trained_steps} (Époque {epoch+1}):")
-                            print(f"  Train Loss = {avg_train_loss:.4f}")
-                            print(f"  Val Loss   = {val_str if eval_loss is not None else 'N/A'}")
-                            print(f"  Perplexity = {ppl_str if perplexity is not None else 'N/A'}")
-                            print("-" * 50)
-
-                        # Sauvegarde du meilleur modèle si la loss d'évaluation est meilleure
-                        if eval_loss is not None and eval_loss < best_eval_loss:
-                            best_eval_loss = eval_loss
-                            best_model_path = os.path.join(self.args.output_dir, "best_model")
-                            self.model.save_pretrained(best_model_path, safe_serialization=False)
-                            print(f"Meilleur modèle sauvegardé à l'étape {total_trained_steps} avec eval_loss = {eval_loss:.4f}")
-
-                        # Réinitialiser les accumulateurs pour le log d'intervalle
-                        epoch_loss_sum = 0.0
-                        epoch_loss_count = 0
-
-            # Fin d'époque : on peut afficher un résumé si nécessaire
-            # (Attention, si l'entraînement s'arrête avant la fin d'une époque, ce résumé risque de couvrir une partie incomplète)
-            if epoch_loss_count > 0:
-                avg_epoch_loss = epoch_loss_sum / epoch_loss_count
-            else:
-                avg_epoch_loss = 0.0
-            logger.info(f"Fin de l'époque {epoch+1} : Train Loss = {avg_epoch_loss:.4f}")
+            print(f"===== Fin de l'ÉPOQUE {epoch + 1}/{num_train_epochs} =====\n")
+            if stop_training:
+                break
+        print("Entraînement terminé. Nombre total de steps:", total_trained_steps)
 
 
     def multitask_train(
@@ -890,19 +677,16 @@ class InvariantTrainer(transformers.Trainer):
             os.makedirs("lm_heads")
 
         for env, lm_head in self.model.lm_heads.items():
-            
-            if not (hasattr(lm_head, "dense") or hasattr(lm_head, "decoder")):
-                #print(f"Avertissement : la tête pour l'environnement {env} ne possède ni 'dense' ni 'decoder'. Enregistrement ignoré.")
-                continue
-
-            
             filepath = os.path.join("lm_heads", "{}-{}".format(env, step_count))
+            
             if hasattr(lm_head, "dense"):
                 np.save(filepath, lm_head.dense.weight.data.cpu().numpy())
             elif hasattr(lm_head, "decoder"):
                 np.save(filepath, lm_head.decoder.weight.data.cpu().numpy())
+            elif hasattr(lm_head, "vocab_projector"):
+                np.save(filepath, lm_head.vocab_projector.weight.data.cpu().numpy())
             else:
-                raise AttributeError(f"lm_head for environment {env} does not have attribute 'dense' or 'decoder'")
+                print(f"La tête pour l'environnement {env} ne possède pas d'attribut de sauvegarde connu.")
 
 
     def get_single_train_dataloader(self, env_name, train_dataset):
