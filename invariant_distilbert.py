@@ -39,9 +39,17 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
     authorized_unexpected_keys = [r"pooler"]
 
     def __init__(self, config, model=None):  # , model, envs):
-        super().__init__(config)
 
+        # Si la configuration n'a pas l'attribut "envs", on l'initialise avec une valeur par défaut, par exemple ["all_train"].
+        if not hasattr(config, "envs"):
+            config.envs = ["all_train"]
+        # Vous pouvez également vous assurer que config.envs est une liste non vide.
+        if len(config.envs) == 0:
+            config.envs = ["all_train"]
+
+        super().__init__(config)
         self.config = config
+        
         if config.is_decoder:
             logger.warning(
                 "If you want to use `RobertaForMaskedLM` make sure `config.is_decoder=False` for "

@@ -456,8 +456,15 @@ def main():
 
     # Entraînement
     if training_args.do_train:
-        if model_args.mode == "mtLM":
-            logger.info("TRAINING WITH DIVERSITY -- NOT FOLLOWING IRM-GAMES DYNAMIC")
+        if model_args.mode == "eLM":
+            print("Entraînement eLM (fine tuning classique)")
+            train_result = trainer.empirical_train(
+                training_set=irm_tokenized_train,  # dans ce cas, training_set devrait contenir une unique clé "all_train"
+                nb_steps=data_args.nb_steps,
+                num_train_epochs=training_args.num_train_epochs,
+            )
+        elif model_args.mode == "mtLM":
+            print("TRAINING WITH DIVERSITY -- NOT FOLLOWING IRM-GAMES DYNAMIC")
             train_result = trainer.multitask_train(
                 training_set=irm_tokenized_train,
                 nb_steps=nb_steps,
@@ -465,7 +472,7 @@ def main():
                 num_train_epochs=training_args.num_train_epochs,
             )
         elif model_args.mode == "ensLM":
-            logger.info("TRAINING WITH ENSEMBLE -- NOT FOLLOWING IRM-GAMES DYNAMIC")
+            print("TRAINING WITH ENSEMBLE -- NOT FOLLOWING IRM-GAMES DYNAMIC")
             train_result = trainer.ensemble_train(
                 training_set=irm_tokenized_train,
                 nb_steps=nb_steps,
@@ -474,6 +481,7 @@ def main():
                 num_train_epochs=training_args.num_train_epochs,
             )
         elif model_args.mode == "iLM":
+            print("TRAINING WITH ENSEMBLE -- NOT FOLLOWING IRM-GAMES DYNAMIC")
             train_result = trainer.invariant_train(
                 training_set=irm_tokenized_train,
                 nb_steps=nb_steps,
@@ -496,11 +504,21 @@ def main():
     results = {}
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
+
+        # Charger le meilleur modèle sauvegardé (celui avec la meilleure eval loss sur InD)
+        best_model_path = os.path.join(training_args.output_dir, "best_model")
+        if os.path.isdir(best_model_path):
+            print("Rechargement du meilleur modèle sauvegardé pour l'évaluation.")
+            
+            best_model = InvariantDistilBertForMaskedLM.from_pretrained(best_model_path)
+            best_model.to(training_args.device)
+            trainer.model = best_model  # Remplacer le modèle courant par le meilleur modèle
+        else:
+            print("Aucun modèle 'best_model' trouvé, on utilise le modèle final.")
+            best_model = trainer.model
+            best_model.to(training_args.device)
+
         
-        #eval_output = trainer.evaluate()
-        #eval_loss = eval_output["eval_loss"]
-        #perplexity = math.exp(eval_loss) if eval_loss is not None else float('inf')
-        #results = {"perplexity": perplexity}
 
         from torch.utils.data import DataLoader
         from tqdm import tqdm 
@@ -513,7 +531,7 @@ def main():
         )
 
         # Passage du modèle en mode evaluation
-        irm_model.eval()
+        trainer.model.eval()
         total_eval_loss = 0.0
         nb_eval_steps = 0
 
@@ -525,7 +543,7 @@ def main():
                 batch = {k: v.to(training_args.device) for k, v in batch.items()}
                 # Calcul en mode AMP
                 with torch.amp.autocast("cuda"):
-                    outputs = irm_model(**batch)
+                    outputs = best_model(**batch)
                     loss = outputs.loss
                 total_eval_loss += loss.item()
                 nb_eval_steps += 1
@@ -543,6 +561,7 @@ def main():
         print("***** Eval results *****")
         for key, value in sorted(results.items()):
             print(f"{key} = {value:.4f}")
+
         output_eval_file = os.path.join(training_args.output_dir, "eval_results_mlm.txt")
         if trainer.is_world_process_zero():
             with open(output_eval_file, "w") as writer:

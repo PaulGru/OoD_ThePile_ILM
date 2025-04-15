@@ -14,6 +14,10 @@ from tqdm import tqdm
 import math
 import os
 import numpy as np
+
+
+import math
+import os
 from typing import Optional
 
 logger = logging.get_logger(__name__)
@@ -75,11 +79,145 @@ class InvariantTrainer(transformers.Trainer):
         eval_loss = None
         perplexity = None
         if self.eval_dataset is not None:
-            eval_metrics = self.evaluate()  # Utilise la méthode evaluate() héritée (ou définie) dans ta classe Trainer
+            eval_metrics = self.evaluate()
             eval_loss = eval_metrics.get("eval_loss")
             if eval_loss is not None:
                 perplexity = math.exp(eval_loss)
         return eval_loss, perplexity
+    
+
+    def empirical_train(
+            self,
+            training_set,
+            nb_steps: Optional[int] = None,
+            num_train_epochs: Optional[int] = 1,
+            **kwargs):
+        """
+        Fonction d'entraînement pour le fine tuning en mode eLM (empirical risk minimization)
+        sur un unique environnement (par exemple, {"all_train": {"train": dataset}}), en intégrant l'utilisation d'AMP.
+        
+        Pour eLM, la notion de "round" n'est pas nécessaire : l'entraînement se fait par itération séquentielle
+        sur le DataLoader (une passe complète sur l'ensemble des batches constitue une époque).
+        
+        Paramètres :
+        - training_set : dictionnaire contenant le dataset d'entraînement, ex. {"all_train": {"train": dataset}}.
+        - nb_steps : (optionnel) nombre total de steps ; si précisé, num_train_epochs sera recalculé.
+        - num_train_epochs : nombre d'époques à réaliser (défaut 825, pour coller à vos expériences iLM/ensLM).
+        - kwargs : arguments supplémentaires (non utilisés ici).
+        """
+        import math
+        import os
+        from transformers.trainer_callback import TrainerState
+
+        if nb_steps is None and num_train_epochs is None:
+            raise ValueError("Au moins nb_steps ou num_train_epochs doit être défini.")
+        
+        if len(kwargs) > 0:
+            raise TypeError(f"train() received got unexpected keyword arguments: {', '.join(list(kwargs.keys()))}.")
+
+        # On suppose qu'il n'y a qu'un seul environnement, par exemple "all_train"
+        env_key = list(training_set.keys())[0]
+        dataset = training_set[env_key]["train"]
+
+        # On obtient le DataLoader pour cet unique environnement
+        dataloader = self.get_single_train_dataloader(env_key, dataset)
+
+        # Calcul du nombre de steps par époque (nombre de batches divisés par gradient accumulation)
+        num_update_steps_per_epoch = len(dataloader) // self.args.gradient_accumulation_steps
+        if nb_steps is not None:
+            num_train_epochs = max(1, math.ceil(nb_steps / num_update_steps_per_epoch))
+            max_steps = nb_steps
+        else:
+            max_steps = num_update_steps_per_epoch * num_train_epochs
+
+        # Création de l'optimiseur et du scheduler pour l'ensemble du modèle
+        optimizer, lr_scheduler = self.create_optimizer_and_scheduler(self.model, num_training_steps=max_steps)
+
+        self.state = TrainerState()
+        if self.args.n_gpu > 0:
+            self.model.to(self.args.device)
+        if self.args.n_gpu > 1:
+            self.model = torch.nn.DataParallel(self.model)
+
+        # Mise en place du GradScaler pour AMP
+        scaler = torch.amp.GradScaler('cuda')
+
+        total_trained_steps = 0
+        log_interval = 25  # On log tous les 5 steps
+        best_eval_loss = float("inf")
+
+        print("=== Début de l'entraînement eLM (avec AMP) ===")
+        print(f"Nombre de batches par époque : {len(dataloader)} (soit environ {num_update_steps_per_epoch} steps d'update)")
+        print(f"Nombre total de steps prévus : {max_steps}")
+
+        # Boucle d'entraînement par époque (sans subdivision en rounds)
+        for epoch in range(int(num_train_epochs)):
+            epoch_loss_sum = 0.0
+            epoch_steps = 0
+            self.model.train()
+
+            for batch in dataloader:
+                if total_trained_steps >= max_steps:
+                    break
+
+                optimizer.zero_grad()
+                # Déplacement du batch sur le device
+                batch = {k: v.to(self.args.device) for k, v in batch.items()}
+
+                # Forward sous AMP
+                with torch.amp.autocast('cuda'):
+                    outputs = self.model(**batch)
+                    loss = outputs.loss
+
+                scaler.scale(loss).backward()
+
+                # Optionnel : clipping des gradients
+                if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+
+                scaler.step(optimizer)
+                scaler.update()
+                lr_scheduler.step()
+
+                total_trained_steps += 1
+                epoch_loss_sum += loss.item()
+                epoch_steps += 1
+
+                if total_trained_steps % log_interval == 0:
+                    avg_train_loss = epoch_loss_sum / epoch_steps if epoch_steps > 0 else 0.0
+                    eval_loss, perplexity = self.run_evaluation()
+                    print("-" * 50)
+                    print(f"Step {total_trained_steps}:")
+                    print(f"  Train Loss = {avg_train_loss:.4f}")
+                    if eval_loss is not None:
+                        print(f"  Eval Loss  = {eval_loss:.4f}")
+                    if perplexity is not None:
+                        print(f"  Perplexity = {perplexity:.4f}")
+                    print("-" * 50)
+                    # Sauvegarde dans le CSV des logs d'entraînement
+                    if self.is_world_process_zero():
+                        log_path = os.path.join(self.args.output_dir, "training_log.csv")
+                        # Pour la première écriture, on efface le fichier s'il existe et on écrit l'en-tête
+                        if total_trained_steps == log_interval and os.path.exists(log_path):
+                            os.remove(log_path)
+                        if total_trained_steps == log_interval and not os.path.exists(log_path):
+                            with open(log_path, "w") as f:
+                                f.write("epoch,global_step,train_loss,val_loss,perplexity\n")
+                        with open(log_path, "a") as f:
+                            f.write(f"{epoch+1},{total_trained_steps},{avg_train_loss:.4f},{eval_loss:.4f},{perplexity:.4f}\n")
+                        # Sauvegarde du meilleur modèle si eval_loss est améliorée
+                        if eval_loss is not None and eval_loss < best_eval_loss:
+                            best_eval_loss = eval_loss
+                            best_model_path = os.path.join(self.args.output_dir, "best_model")
+                            self.model.save_pretrained(best_model_path, safe_serialization=False)
+                            print(f"--> Nouveau meilleur modèle sauvegardé au step {total_trained_steps} avec eval_loss = {eval_loss:.4f}")
+            
+            print(f"Fin de l'époque {epoch+1} (steps de cette époque : {epoch_steps})")
+            if total_trained_steps >= max_steps:
+                break
+
+        print("=== Entraînement eLM terminé. Nombre total de steps :", total_trained_steps)
 
 
     def invariant_train(
@@ -116,6 +254,7 @@ class InvariantTrainer(transformers.Trainer):
         # Préparation des DataLoader, optimizers et lr_schedulers pour chaque environnement
         dataloaders, optimizers, lr_schedulers = {}, {}, {}
         for env_name, data_features in training_set.items():
+
             dataloaders[env_name] = self.get_single_train_dataloader(env_name, data_features["train"])
             if hasattr(self.model, "lm_heads"):
                 optimizer_env, lr_scheduler_env = self.create_optimizer_and_scheduler(
@@ -263,8 +402,7 @@ class InvariantTrainer(transformers.Trainer):
                         best_model_path = os.path.join(self.args.output_dir, "best_model")
                         self.model.save_pretrained(best_model_path, safe_serialization=False)
                         print(f"Meilleur modèle sauvegardé à l'étape {total_trained_steps} avec eval_loss = {eval_loss:.4f}")
-
-                
+      
                 if stop_training:
                     break
 
@@ -449,7 +587,8 @@ class InvariantTrainer(transformers.Trainer):
                                 f.write("epoch,global_step,train_loss,val_loss,perplexity\n")
                         with open(log_path, "a") as f:
                             f.write(f"{epoch+1},{total_trained_steps},{avg_round_loss:.4f},{eval_loss:.4f},{perplexity:.4f}\n")
-
+                        print(f"--> Résumé [Step {total_trained_steps}] : Loss moyenne = {avg_round_loss:.4f}, Eval Loss = {eval_loss:.4f}, Perplexity = {perplexity:.4f}")
+                        
                     # Sauvegarde du meilleur modèle si la loss d'évaluation est meilleure
                     if eval_loss is not None and eval_loss < best_eval_loss:
                         best_eval_loss = eval_loss
@@ -463,6 +602,7 @@ class InvariantTrainer(transformers.Trainer):
             print(f"===== Fin de l'ÉPOQUE {epoch + 1}/{num_train_epochs} =====\n")
             if stop_training:
                 break
+
         print("Entraînement terminé. Nombre total de steps:", total_trained_steps)
 
 
@@ -668,6 +808,10 @@ class InvariantTrainer(transformers.Trainer):
         self.save_model(output_dir=fname)
 
     def save_heads(self, step_count):
+        # Ne sauvegarder que si ce processus est le principal
+        if not self.is_world_process_zero():
+            return
+    
         if not hasattr(self.model, "lm_heads"):
             # Si le modèle n'a pas d'attribut lm_heads (mode eLM), on ne sauvegarde rien.
             return

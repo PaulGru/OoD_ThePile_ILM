@@ -74,7 +74,7 @@ def plot_perplexity(log_path="training_log.csv", output_path=None):
 
 
 if __name__ == "__main__":
-    log_file_path = "output/thePile_iLM_InD/training_log.csv"
+    log_file_path = "output/thePile_eLM_InD/training_log.csv"
     plot_learning_curve(log_file_path, output_path="learning_curve.png")
     plot_validation_loss(log_file_path, output_path="validation_curve.png")
     plot_perplexity(log_file_path, output_path="perplexity.png")
