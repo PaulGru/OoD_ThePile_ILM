@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 import math
 import os
+import csv
 import numpy as np
 
 
@@ -143,7 +144,7 @@ class InvariantTrainer(transformers.Trainer):
         scaler = torch.amp.GradScaler('cuda')
 
         total_trained_steps = 0
-        log_interval = 25  # On log tous les 5 steps
+        log_interval = 66  # On log tous les 5 steps
         best_eval_loss = float("inf")
 
         print("=== Début de l'entraînement eLM (avec AMP) ===")
@@ -290,7 +291,7 @@ class InvariantTrainer(transformers.Trainer):
         saving_heads = bool(nb_steps_heads_saving > 0)
         saving_intermediary_models = bool(nb_steps_model_saving > 0)
         total_trained_steps = 0
-        log_interval = 5  # Par exemple, log tous les 5 steps
+        log_interval = 66  # Par exemple, log tous les 5 steps
 
         best_eval_loss = float('inf')
         stop_training = False
@@ -298,10 +299,25 @@ class InvariantTrainer(transformers.Trainer):
         # Initialisation du scaler pour AMP
         scaler = torch.amp.GradScaler("cuda")
 
+        # --- Préparation du fichier CSV pour enregistrer l'historique ---
+        csv_file = os.path.join(self.args.output_dir, "training_loss_history.csv")
+        if self.is_world_process_zero():
+            # Si le fichier existe déjà, on le supprime
+            if os.path.exists(csv_file):
+                os.remove(csv_file)
+            # Écriture de l'en-tête
+            header = ["Epoch"] + list(training_set.keys())
+            with open(csv_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+
         for epoch in range(int(num_train_epochs)):
             print("\n" + "=" * 70)
             print(f"===== DÉBUT DE L'ÉPOQUE {epoch + 1}/{num_train_epochs} =====")
             print("=" * 70 + "\n")
+
+            # Dictionnaire pour accumuler la loss de chaque environnement pendant l'époque
+            env_epoch_losses = {env_name: [] for env_name in training_set.keys()}
 
             # Rendre itérables tous les DataLoader par environnement
             iter_loaders = {env_name: iter(dataloaders[env_name]) for env_name in training_set.keys()}
@@ -340,6 +356,8 @@ class InvariantTrainer(transformers.Trainer):
 
                     # Accumulation de la loss pour le reporting
                     step_loss = loss.item()
+                    env_epoch_losses[env_name].append(step_loss)
+
                     round_loss_sum += step_loss
                     round_loss_count += 1
                     print(f"    Loss pour l'environnement {env_name}: {step_loss:.4f}")
@@ -407,6 +425,27 @@ class InvariantTrainer(transformers.Trainer):
                     break
 
             print(f"===== Fin de l'ÉPOQUE {epoch + 1}/{num_train_epochs} =====\n")
+            print("Résumé des pertes moyennes par environnement pour cette époque :")
+            # Calcul et affichage des pertes moyennes pour chaque environnement
+            epoch_summary = {}
+            for env_name, losses in env_epoch_losses.items():
+                if losses:
+                    avg_loss = sum(losses) / len(losses)
+                    epoch_summary[env_name] = avg_loss
+                    print(f"  {env_name} : {avg_loss:.4f} (basé sur {len(losses)} updates)")
+                else:
+                    epoch_summary[env_name] = None
+                    print(f"  {env_name} : aucune donnée de loss enregistrée.")
+
+            # Sauvegarde dans un fichier CSV pour pouvoir tracer les courbes ultérieurement
+            if self.is_world_process_zero():
+                with open(csv_file, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    row = [epoch + 1]
+                    for env_name in training_set.keys():
+                        row.append(epoch_summary.get(env_name) if epoch_summary.get(env_name) is not None else "")
+                    writer.writerow(row)
+            
             if stop_training:
                 break
         
@@ -480,18 +519,32 @@ class InvariantTrainer(transformers.Trainer):
         saving_heads = bool(nb_steps_heads_saving > 0)
         saving_intermediary_models = bool(nb_steps_model_saving > 0)
         total_trained_steps = 0
-        log_interval = 5
+        log_interval = 66
 
         best_eval_loss = float('inf')
         stop_training = False
 
         # Initialisation du scaler pour AMP
         scaler = torch.amp.GradScaler("cuda")
+
+        csv_file = os.path.join(self.args.output_dir, "training_loss_history.csv")
+        if self.is_world_process_zero():
+            # Si le fichier existe déjà, on le supprime
+            if os.path.exists(csv_file):
+                os.remove(csv_file)
+            # Écriture de l'en-tête
+            header = ["Epoch"] + list(training_set.keys())
+            with open(csv_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
         
         for epoch in range(int(num_train_epochs)):
             print("\n" + "=" * 70)
             print(f"===== DÉBUT DE L'ÉPOQUE {epoch + 1}/{num_train_epochs} =====")
             print("=" * 70 + "\n")
+
+            # Dictionnaire pour accumuler la loss de chaque environnement pendant l'époque
+            env_epoch_losses = {env_name: [] for env_name in training_set.keys()}
 
             # make all dataloader iterateable
             iter_loaders = {}
@@ -533,6 +586,8 @@ class InvariantTrainer(transformers.Trainer):
 
                     # Accumulation de la loss pour le reporting
                     step_loss = loss.item()
+                    env_epoch_losses[env_name].append(step_loss)
+
                     round_loss_sum += step_loss
                     round_loss_count += 1
                     print(f"    Loss pour l'environnement {env_name}: {step_loss:.4f}")
@@ -578,6 +633,7 @@ class InvariantTrainer(transformers.Trainer):
 
                 if total_trained_steps % log_interval == 0:
                     eval_loss, perplexity = self.run_evaluation()
+
                     if self.is_world_process_zero():
                         log_path = os.path.join(self.args.output_dir, "training_log.csv")
                         if total_trained_steps == log_interval and os.path.exists(log_path):
@@ -600,6 +656,27 @@ class InvariantTrainer(transformers.Trainer):
                     break
 
             print(f"===== Fin de l'ÉPOQUE {epoch + 1}/{num_train_epochs} =====\n")
+            print("Résumé des pertes moyennes par environnement pour cette époque :")
+            # Calcul et affichage des pertes moyennes pour chaque environnement
+            epoch_summary = {}
+            for env_name, losses in env_epoch_losses.items():
+                if losses:
+                    avg_loss = sum(losses) / len(losses)
+                    epoch_summary[env_name] = avg_loss
+                    print(f"  {env_name} : {avg_loss:.4f} (basé sur {len(losses)} updates)")
+                else:
+                    epoch_summary[env_name] = None
+                    print(f"  {env_name} : aucune donnée de loss enregistrée.")
+
+            # Sauvegarde dans un fichier CSV pour pouvoir tracer les courbes ultérieurement
+            if self.is_world_process_zero():
+                with open(csv_file, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    row = [epoch + 1]
+                    for env_name in training_set.keys():
+                        row.append(epoch_summary.get(env_name) if epoch_summary.get(env_name) is not None else "")
+                    writer.writerow(row)
+
             if stop_training:
                 break
 

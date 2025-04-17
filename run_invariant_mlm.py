@@ -20,6 +20,7 @@ https://huggingface.co/models?filter=masked-lm
 import logging
 import math
 import os
+import csv
 import sys
 import torch
 from dataclasses import dataclass, field
@@ -481,7 +482,7 @@ def main():
                 num_train_epochs=training_args.num_train_epochs,
             )
         elif model_args.mode == "iLM":
-            print("TRAINING WITH ENSEMBLE -- NOT FOLLOWING IRM-GAMES DYNAMIC")
+            print("TRAINING WITH INVARIANCE -- FOLLOWING IRM-GAMES DYNAMIC")
             train_result = trainer.invariant_train(
                 training_set=irm_tokenized_train,
                 nb_steps=nb_steps,
@@ -509,8 +510,11 @@ def main():
         best_model_path = os.path.join(training_args.output_dir, "best_model")
         if os.path.isdir(best_model_path):
             print("Rechargement du meilleur modèle sauvegardé pour l'évaluation.")
-            
-            best_model = InvariantDistilBertForMaskedLM.from_pretrained(best_model_path)
+            # Si le mode est "eLM", c'est un modèle classique, sinon c'est un modèle invariant multi-têtes.
+            if model_args.mode == "eLM":
+                best_model = AutoModelForMaskedLM.from_pretrained(best_model_path)
+            else:
+                best_model = InvariantDistilBertForMaskedLM.from_pretrained(best_model_path)
             best_model.to(training_args.device)
             trainer.model = best_model  # Remplacer le modèle courant par le meilleur modèle
         else:

@@ -111,14 +111,6 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
         for env, lm_head in self.lm_heads.items():
             lm_head.decoder = new_embeddings
 
-    # @add_start_docstrings_to_callable(ROBERTA_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
-    # @add_code_sample_docstrings(
-    #     tokenizer_class=_TOKENIZER_FOR_DOC,
-    #     checkpoint="roberta-base",
-    #     output_type=MaskedLMOutput,
-    #     config_class=_CONFIG_FOR_DOC,
-    #     mask="<mask>",
-    # )
     def forward(
         self,
         input_ids=None,
