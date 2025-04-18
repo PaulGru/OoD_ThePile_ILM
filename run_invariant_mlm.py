@@ -124,10 +124,6 @@ class ModelArguments:
         default=0,
         metadata={"help": "Number of training steps between saving the full model (if 0, the heads are not saved regularly)."},
     )
-    do_lower_case: Optional[bool] = field(
-        default=True,
-        metadata={"help": "Lower-case during tokenization."},
-    )
     dropout: float = field(
         default=0.1,
         metadata={"help": "Taux de dropout pour le modèle."}
@@ -155,10 +151,6 @@ class DataTrainingArguments:
     )
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
-    )
-    validation_split_percentage: Optional[int] = field(
-        default=5,
-        metadata={"help": "The percentage of the train set used as validation set in case there's no validation split"}
     )
     max_seq_length: Optional[int] = field(
         default=None,

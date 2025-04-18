@@ -1,13 +1,15 @@
+
 import os
 from datasets import load_dataset
 from transformers import DistilBertTokenizerFast
 
-# 1. Charger le dataset complet
-full_dataset = load_dataset("ola13/small-the_pile", split="train")
+# 1. Charger l'intégralité du dataset AG News ("original" config, split "complete")
+full_dataset = load_dataset("contemmcm/ag_news", "original", split="complete")
 
-# 2. Fonctions de prétraitement
+label_names = full_dataset.features["label"].names
+
 def extract_environment(example):
-    return {"environment": example["meta"].get("pile_set_name", "unknown")}
+    return {"environment": label_names[example["label"]]}
 
 def count_tokens(example):
     token_ids = tokenizer.encode(example["text"], add_special_tokens=False)
@@ -16,36 +18,19 @@ def count_tokens(example):
 def compute_raw_weight(example):
     return {"raw_weight": len(example["text"].encode("utf-8"))}
 
+def sanitize_filename(name):
+    return name.replace("/", "_").replace("\\", "_").replace(" ", "_")
+
 # Initialiser le tokenizer et appliquer les maps
 tokenizer = DistilBertTokenizerFast.from_pretrained("distilbert-base-uncased")
 full_dataset = full_dataset.map(extract_environment)
 full_dataset = full_dataset.map(count_tokens, batched=False)
 full_dataset = full_dataset.map(compute_raw_weight, batched=False)
 
-# 3. Listes d'environnements
-ood_envs = [
-    "Wikipedia (en)",
-    "Pile-CC",
-    "EuroParl",
-    "ArXiv",
-    "Enron Emails",
-    "OpenWebText2",
-    "PubMed Abstracts",
-    "Github",
-    "ArXiv",
-    "BookCorpus2",
-    "Books3",
-    "HackerNews",
-    "NIH ExPorter",
-    "PubMed Central",
-    "StackExchange",
-    "USPTO Backgrounds",
-    "OpenSubtitles",
-]
-train_envs = [
-    "DM Mathematics",
-    "FreeLaw",
-]
+# 3. Définir vos environnements InD et OoD à partir des 4 catégories
+# (ajustez ces listes selon votre expérience)
+train_envs = ["Top Stories", "Italia", "Top News", "Europe", "U.S.", "World", "Sports", "Health", "Software and Developement", "Sci/Tech", "Business", "Entertainment"]
+ood_envs   = []
 
 # 4. Filtrer In-Domain et OoD
 ind_dataset = full_dataset.filter(lambda x: x["environment"] in train_envs)
@@ -85,7 +70,7 @@ print(f"OoD validation file created with {len(ood_dataset)} examples.")
 # 9. Sauvegarder les fichiers par environnement (train only)
 for env in train_envs:
     subset_train = ind_train.filter(lambda x: x["environment"] == env)
-    output_file = os.path.join(output_folder, f"{env}.txt")
+    output_file = os.path.join(output_folder, f"{sanitize_filename(env)}.txt")
     write_dataset_to_file(subset_train, output_file)
     print(f"Train file for '{env}' created with {len(subset_train)} examples.")
 
