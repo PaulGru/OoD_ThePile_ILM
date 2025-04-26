@@ -246,14 +246,35 @@ def main():
                 train_folder = data_args.train_file
                 print("Contenu de train_env :", os.listdir(train_folder))
                 train_datasets = {}
-                for file in os.listdir(train_folder):
-                    if file.endswith('.txt'):
-                        env_name = file.split(".")[0]
-                        # Pour iLM, on ignore "all_train" s'il existe
-                        if model_args.mode != "eLM" and env_name == "all_train":
-                            continue
-                        data_files = {"train": os.path.join(train_folder, file)}
-                        train_datasets[env_name] = load_dataset("text", data_files=data_files)
+                
+                if model_args.mode == "eLM":
+                    # eLM doit avoir exactement un environnement global
+                    all_train_path = os.path.join(train_folder, "all_train.txt")
+                    if os.path.exists(all_train_path):
+                        data_files = {"train": all_train_path}
+                        dataset = load_dataset("text", data_files=data_files)
+                        train_datasets = {"all_train": dataset}
+                    else:
+                        # Fusion explicite de tous les fichiers d'environnements
+                        merged_file_path = os.path.join(train_folder, "merged_all_train.txt")
+                        with open(merged_file_path, 'w', encoding='utf-8') as outfile:
+                            for fname in os.listdir(train_folder):
+                                if fname.endswith('.txt'):
+                                    with open(os.path.join(train_folder, fname), encoding='utf-8') as infile:
+                                        for line in infile:
+                                            outfile.write(line)
+                        dataset = load_dataset("text", data_files={"train": merged_file_path})
+                        train_datasets = {"all_train": dataset}
+                else:
+                    # iLM/ensLM : chargement normal par environnement
+                    for file in os.listdir(train_folder):
+                        if file.endswith('.txt'):
+                            env_name = file.split(".")[0]
+                            if env_name == "all_train":
+                                continue
+                            data_files = {"train": os.path.join(train_folder, file)}
+                            train_datasets[env_name] = load_dataset("text", data_files=data_files)
+                        
             else:
                 data_files = {"train": data_args.train_file}
                 dataset = load_dataset("text", data_files=data_files)
@@ -261,10 +282,13 @@ def main():
         else:
             raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
 
+
         # Définition de la variable envs à partir des clés de train_datasets.
-        envs = [k for k in train_datasets.keys() if k != "all_train"]
         if model_args.mode == "eLM":
+            envs = ["all_train"]  # Toujours un unique environnement explicite en eLM
+        else:
             envs = list(train_datasets.keys())
+
     else:
         train_datasets = {}
         # Mode évaluation uniquement ; définir envs à une valeur par défaut.
@@ -356,6 +380,9 @@ def main():
 
     irm_model.resize_token_embeddings(len(tokenizer))
 
+    # Vérification du nombre de têtes du modèle (important pour le mode eLM)
+    num_heads = len(irm_model.lm_heads) if hasattr(irm_model, 'lm_heads') else "Standard (une tête)"
+    print(f"[DEBUG] Nombre de têtes du modèle en mode {model_args.mode} : {num_heads}")
 
     # AJOUT : enregistrement des hooks de débogage pour identifier les NaNs
     #from hooks import register_nan_forward_hooks, register_nan_backward_hooks

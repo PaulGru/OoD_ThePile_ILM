@@ -106,9 +106,6 @@ class InvariantTrainer(transformers.Trainer):
         - num_train_epochs : nombre d'époques à réaliser (défaut 825, pour coller à vos expériences iLM/ensLM).
         - kwargs : arguments supplémentaires (non utilisés ici).
         """
-        import math
-        import os
-        from transformers.trainer_callback import TrainerState
 
         if nb_steps is None and num_train_epochs is None:
             raise ValueError("Au moins nb_steps ou num_train_epochs doit être défini.")
@@ -144,7 +141,7 @@ class InvariantTrainer(transformers.Trainer):
         scaler = torch.amp.GradScaler('cuda')
 
         total_trained_steps = 0
-        log_interval = 66  # On log tous les 5 steps
+        log_interval = 30  # On log tous les 5 steps
         best_eval_loss = float("inf")
 
         print("=== Début de l'entraînement eLM (avec AMP) ===")
@@ -291,7 +288,7 @@ class InvariantTrainer(transformers.Trainer):
         saving_heads = bool(nb_steps_heads_saving > 0)
         saving_intermediary_models = bool(nb_steps_model_saving > 0)
         total_trained_steps = 0
-        log_interval = 66  # Par exemple, log tous les 5 steps
+        log_interval = 180  # Par exemple, log tous les 5 steps
 
         best_eval_loss = float('inf')
         stop_training = False

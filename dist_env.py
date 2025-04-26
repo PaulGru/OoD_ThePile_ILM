@@ -7,13 +7,13 @@ from sklearn.manifold import TSNE
 from transformers import DistilBertTokenizerFast, DistilBertModel
 import torch
 from tqdm import tqdm
+import pandas as pd
 
 # Initialisation
-env_dir = "small_the_pile_env"  # dossier contenant les fichiers par environnement
+env_dir = "small_the_pile_env"
 output_dir = "embedding_projections"
 os.makedirs(output_dir, exist_ok=True)
-
-nb_exemples_par_env = 200  # nombre d'exemples à échantillonner par environnement
+nb_exemples_par_env = 500
 
 # Charger tokenizer et modèle BERT
 tokenizer = DistilBertTokenizerFast.from_pretrained("distilbert-base-uncased")
@@ -48,16 +48,17 @@ with torch.no_grad():
 # Transformation en numpy
 all_embeddings = np.stack(all_embeddings)
 
-# Réduction de dimension : PCA (2D)
+# Réduction de dimension : PCA
 pca = PCA(n_components=2)
 proj_pca = pca.fit_transform(all_embeddings)
 
-# t-SNE (plus lent mais plus lisible si non-linéaire)
+# t-SNE
 tsne = TSNE(n_components=2, perplexity=30, init="pca", random_state=42)
 proj_tsne = tsne.fit_transform(all_embeddings)
 
-# Affichage
+# Affichage des projections
 sns.set(style="whitegrid", rc={"figure.figsize": (12, 7)})
+
 def plot_proj(proj, title, filename):
     plt.figure()
     sns.scatterplot(x=proj[:, 0], y=proj[:, 1], hue=all_labels, palette="tab20", s=40, edgecolor=None, alpha=0.8)
@@ -71,4 +72,46 @@ def plot_proj(proj, title, filename):
 
 plot_proj(proj_pca, "Projection PCA de tous les environnements", "pca_projection_all_envs.png")
 plot_proj(proj_tsne, "Projection t-SNE de tous les environnements", "tsne_projection_all_envs.png")
-print(f"Plots enregistrés dans le dossier : {output_dir}")
+
+# Calcul MMD entre environnements
+def compute_mmd(x, y, gamma=1.0):
+    def gaussian_kernel(a, b):
+        dist = ((a.unsqueeze(1) - b.unsqueeze(0)) ** 2).sum(2)
+        return torch.exp(-gamma * dist)
+
+    K_xx = gaussian_kernel(x, x)
+    K_yy = gaussian_kernel(y, y)
+    K_xy = gaussian_kernel(x, y)
+    return K_xx.mean() + K_yy.mean() - 2 * K_xy.mean()
+
+# Organiser les embeddings par environnement
+env_to_embeddings = {}
+for emb, label in zip(all_embeddings, all_labels):
+    env_to_embeddings.setdefault(label, []).append(emb)
+
+for k in env_to_embeddings:
+    env_to_embeddings[k] = torch.tensor(np.array(env_to_embeddings[k]))
+
+envs = list(env_to_embeddings.keys())
+mmd_matrix = np.zeros((len(envs), len(envs)))
+
+for i, env_i in enumerate(envs):
+    for j, env_j in enumerate(envs):
+        if i <= j:
+            mmd = compute_mmd(env_to_embeddings[env_i], env_to_embeddings[env_j]).item()
+            mmd_matrix[i, j] = mmd_matrix[j, i] = mmd
+
+# Affichage de la matrice MMD
+plt.figure(figsize=(12, 10))
+sns.heatmap(mmd_matrix, xticklabels=envs, yticklabels=envs, cmap="viridis", square=True, annot=True, fmt=".2f")
+plt.title("Matrice des distances MMD entre environnements")
+plt.tight_layout()
+
+df_mmd = pd.DataFrame(mmd_matrix, index=envs, columns=envs)
+df_mmd.to_csv(os.path.join(output_dir, "mmd_matrix_all_envs.csv"))
+
+plt.savefig(os.path.join(output_dir, "mmd_matrix_all_envs.png"))
+plt.close()
+
+# Export sous forme de DataFrame pour consultation
+df_mmd = pd.DataFrame(mmd_matrix, index=envs, columns=envs)

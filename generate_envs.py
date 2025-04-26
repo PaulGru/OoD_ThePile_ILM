@@ -31,29 +31,29 @@ full_dataset = full_dataset.map(compute_raw_weight, batched=False)
 train_envs = [
     "Wikipedia (en)",
     "Pile-CC",
-    "EuroParl",
     "ArXiv",
-    "BookCorpus2",
     "Books3",
     "HackerNews",
     "NIH ExPorter",
     "StackExchange",
     "USPTO Backgrounds",
     "OpenSubtitles",
-    "DM Mathematics",
     "FreeLaw",
     "YoutubeSubtitles",
     "OpenWebText2",
-    "Github",
     "Enron Emails",
     "PubMed Central",
     "PubMed Abstracts",
+    "EuroParl",
+    "Github",
+    "DM Mathematics",
+    
+]
+ood_envs = [
     "Ubuntu IRC",
     "Gutenberg (PG-19)",
     "PhilPapers",
-]
-ood_envs = [
-    
+    "BookCorpus2",
 ]
 
 # 4. Filtrer In-Domain et OoD
@@ -66,7 +66,7 @@ ind_train = ind_split["train"]
 ind_val = ind_split["test"]
 
 # 6. Création des dossiers de sortie
-output_folder = "small_the_pile_env"
+output_folder = "Pile_envs"
 train_folder = os.path.join(output_folder, "train_env")
 val_folder = os.path.join(output_folder, "val_env")
 os.makedirs(train_folder, exist_ok=True)
