@@ -51,10 +51,6 @@ class InvariantRobertaForMaskedLM(RobertaPreTrainedModel):
             self.__setattr__(env_name + '_head', self.lm_heads[env_name])
         #     self.register_parameter(name=env_name, param=lm_head)
 
-        self.encoder.to('cuda')
-        for _, lm_head in self.lm_heads.items():
-            lm_head.to('cuda')
-
         self.n_environments = len(self.lm_heads)
 
     def print_lm_w(self):

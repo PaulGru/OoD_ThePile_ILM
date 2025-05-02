@@ -141,7 +141,7 @@ class InvariantTrainer(transformers.Trainer):
         scaler = torch.amp.GradScaler('cuda')
 
         total_trained_steps = 0
-        log_interval = 30  # On log tous les 5 steps
+        log_interval = 180  # On log tous les 5 steps
         best_eval_loss = float("inf")
 
         print("=== Début de l'entraînement eLM (avec AMP) ===")
@@ -229,7 +229,6 @@ class InvariantTrainer(transformers.Trainer):
     ):
         if nb_steps is None and num_train_epochs is None:
             raise ValueError("Both nb_steps and num_train_epochs can't be None at the same time")
-
         if len(kwargs) > 0:
             raise TypeError(f"train() received got unexpected keyword arguments: {', '.join(list(kwargs.keys()))}.")
 
@@ -252,8 +251,8 @@ class InvariantTrainer(transformers.Trainer):
         # Préparation des DataLoader, optimizers et lr_schedulers pour chaque environnement
         dataloaders, optimizers, lr_schedulers = {}, {}, {}
         for env_name, data_features in training_set.items():
-
             dataloaders[env_name] = self.get_single_train_dataloader(env_name, data_features["train"])
+            
             if hasattr(self.model, "lm_heads"):
                 optimizer_env, lr_scheduler_env = self.create_optimizer_and_scheduler(
                     self.model.lm_heads[env_name],
@@ -273,6 +272,7 @@ class InvariantTrainer(transformers.Trainer):
             shared_encoder = self.model.distilbert
         else:
             raise AttributeError("The model does not have an encoder attribute.")
+        
         optimizer, lr_scheduler = self.create_optimizer_and_scheduler(shared_encoder, num_training_steps=max_steps)
 
         self.state = TrainerState()
@@ -288,7 +288,7 @@ class InvariantTrainer(transformers.Trainer):
         saving_heads = bool(nb_steps_heads_saving > 0)
         saving_intermediary_models = bool(nb_steps_model_saving > 0)
         total_trained_steps = 0
-        log_interval = 180  # Par exemple, log tous les 5 steps
+        log_interval = 100  # Par exemple, log tous les 5 steps
 
         best_eval_loss = float('inf')
         stop_training = False
@@ -307,6 +307,8 @@ class InvariantTrainer(transformers.Trainer):
             with open(csv_file, "w", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(header)
+
+        skipped_batches = 0  # 💥 Initialiser le compteur
 
         for epoch in range(int(num_train_epochs)):
             print("\n" + "=" * 70)
@@ -332,35 +334,74 @@ class InvariantTrainer(transformers.Trainer):
 
                     print(f"[Step {total_trained_steps + 1}] Entraînement sur l'environnement : {env_name}")
 
-                    # Réinitialisation des gradients pour l'encodeur partagé et la tête de l'environnement courant
-                    optimizer.zero_grad()
-                    optimizers[env_name].zero_grad()
-
                     try:
                         batch = next(iter_loaders[env_name])
                     except StopIteration:
                         iter_loaders[env_name] = iter(dataloaders[env_name])
                         batch = next(iter_loaders[env_name])
+                    
+                    if batch is None:
+                        print(f" Batch vide pour {env_name}, on passe au suivant.")
+                        continue  # saute ce batch, passe au prochain environnement
 
                     # On s'assure que la batch est sur le bon device
                     batch = {k: v.to(self.args.device) for k, v in batch.items()}
 
+                    # Réinitialisation des gradients pour l'encodeur partagé et la tête de l'environnement courant
+                    optimizer.zero_grad()
+                    optimizers[env_name].zero_grad()
+  
                     self.model.train()
-                    # Calcul du forward en AMP
-                    with torch.amp.autocast("cuda"):               
+
+                    # Désactiver les gradients des têtes non-actives
+                    for name, head in self.model.lm_heads.items():
+                        if name != env_name:
+                            for param in head.parameters():
+                                param.requires_grad = False
+                    
+
+                   # Forward avec logits moyennés (toutes les têtes) et AMP
+                    with torch.amp.autocast("cuda"):
                         outputs = self.model(**batch, env_name=env_name)
+                        
+                    # Si outputs est un dict, on prend outputs["loss"], sinon outputs[0]
+                    loss = None
+                    if isinstance(outputs, dict):
+                        loss = outputs.get("loss", None)
+                    elif hasattr(outputs, "loss"):
                         loss = outputs.loss
+                    elif torch.is_tensor(outputs):
+                        loss = outputs[0]
+
+                    # 💥 Gérer si `loss` est None (batch vide par exemple)
+                    if loss is None:
+                        print(f"⚠️ Batch vide détecté pour {env_name}, on saute cette étape.")
+                        skipped_batches += 1
+                        continue
+
+                    # 💥 Gérer si la loss est NaN ou Inf
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"⚠️ WARNING: Loss is NaN or Inf ({loss.item()}) à ce batch, skipping batch.")
+                        skipped_batches += 1
+                        continue
 
                     # Accumulation de la loss pour le reporting
                     step_loss = loss.item()
                     env_epoch_losses[env_name].append(step_loss)
-
                     round_loss_sum += step_loss
                     round_loss_count += 1
                     print(f"    Loss pour l'environnement {env_name}: {step_loss:.4f}")
 
-                    # Rétropropagation avec AMP
+                    # Rétropropagation avec AMP sur encodeur + tête active seulement
                     scaler.scale(loss).backward()
+
+                    # Réactiver les gradients des têtes non-actives après backward
+                    for name, head in self.model.lm_heads.items():
+                        if name != env_name:
+                            for param in head.parameters():
+                                param.requires_grad = True
+
+
 
                     # Clipping des gradients si nécessaire
                     if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
@@ -395,6 +436,7 @@ class InvariantTrainer(transformers.Trainer):
                 else:
                     avg_round_loss = 0.0
 
+                print(f"✅ Round terminé : {skipped_batches} batchs sautés pour cause de batch vide ou NaN/Inf.")
                 print(f"----- Fin du round {round_idx + 1}/{num_rounds_per_epoch}: Loss moyenne sur ce round = {avg_round_loss:.4f} -----\n")
 
                 # Logging et évaluation périodique
@@ -877,6 +919,243 @@ class InvariantTrainer(transformers.Trainer):
             logger.info(f"Fin de l'époque {epoch+1} : Train Loss = {avg_epoch_loss:.4f}")
     
 
+    def invariant_train_games(
+            self,
+            training_set,
+            nb_steps: Optional[int] = None,
+            nb_steps_heads_saving: Optional[int] = 0,
+            num_train_epochs: Optional[int] = 1,
+            nb_steps_model_saving: Optional[int] = 0,
+            update_phi_every_k: Optional[int] = 5,
+            **kwargs
+    ):
+        if nb_steps is None and num_train_epochs is None:
+            raise ValueError("Both nb_steps and num_train_epochs can't be None.")
+        if len(kwargs) > 0:
+            raise TypeError(f"train() received unexpected keyword arguments: {', '.join(list(kwargs.keys()))}.")
+
+        min_train_set_size = min([len(data["train"]) for _, data in training_set.items()])
+        num_envs = len(training_set)
+        num_rounds_per_epoch = math.floor(
+            min_train_set_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size)
+        )
+
+        if nb_steps is not None:
+            total_steps_per_epoch = num_rounds_per_epoch * num_envs
+            num_train_epochs = max(1, math.ceil(nb_steps / total_steps_per_epoch))
+            max_steps = nb_steps
+        else:
+            total_steps_per_epoch = num_rounds_per_epoch * num_envs
+            max_steps = total_steps_per_epoch * num_train_epochs
+
+        dataloaders, optimizers, lr_schedulers = {}, {}, {}
+        for env_name, data_features in training_set.items():
+            dataloaders[env_name] = self.get_single_train_dataloader(env_name, data_features["train"])
+            
+            if hasattr(self.model, "lm_heads"):
+                optimizer_env, lr_scheduler_env = self.create_optimizer_and_scheduler(
+                    self.model.lm_heads[env_name],
+                    num_training_steps=max_steps
+                )
+            else:
+                optimizer_env, lr_scheduler_env = self.create_optimizer_and_scheduler(
+                    self.model, num_training_steps=max_steps
+                )
+            
+            optimizers[env_name] = optimizer_env
+            lr_schedulers[env_name] = lr_scheduler_env
+
+        # Optimizer et scheduler pour le modèle partagé (l'encodeur)
+        if hasattr(self.model, 'encoder'):
+            shared_encoder = self.model.encoder
+        elif hasattr(self.model, 'distilbert'):
+            shared_encoder = self.model.distilbert
+        else:
+            raise AttributeError("The model does not have an encoder attribute.")
+
+        optimizer, lr_scheduler = self.create_optimizer_and_scheduler(shared_encoder, num_training_steps=max_steps)
+
+        self.state = TrainerState()
+        if self.args.n_gpu > 0:
+            self.model.to(self.args.device)
+        if self.args.n_gpu > 1:
+            self.model = torch.nn.DataParallel(self.model)
+        
+        total_train_batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
+        print("Nombre total d'exemples traités approximativement :", total_train_batch_size * max_steps)
+        print(min_train_set_size)
+
+        total_trained_steps = 0
+        phi_accum_loss = 0
+        phi_update_counter = 0
+        phi_batches = []
+
+        best_eval_loss = float('inf')
+        saving_heads = bool(nb_steps_heads_saving > 0)
+        saving_intermediary_models = bool(nb_steps_model_saving > 0)
+        log_interval = 50
+
+        scaler = torch.amp.GradScaler("cuda")
+
+        csv_file = os.path.join(self.args.output_dir, "training_loss_history.csv")
+        if self.is_world_process_zero():
+            if os.path.exists(csv_file):
+                os.remove(csv_file)
+            header = ["Epoch"] + list(training_set.keys())
+            with open(csv_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+
+        stop_training = False
+
+        for epoch in range(int(num_train_epochs)):
+            print("\n" + "=" * 70)
+            print(f"===== DÉBUT DE L'ÉPOQUE {epoch + 1}/{num_train_epochs} =====")
+            print("=" * 70 + "\n")
+
+            env_epoch_losses = {env_name: [] for env_name in training_set.keys()}
+            iter_loaders = {env_name: iter(dataloaders[env_name]) for env_name in training_set.keys()}
+
+            for round_idx in range(num_rounds_per_epoch):
+                round_loss_sum = 0.0
+                round_loss_count = 0
+
+                print(f"----- Début du round {round_idx + 1}/{num_rounds_per_epoch} : Mise à jour de tous les environnements -----")
+
+                for env_name in training_set.keys():
+                    if total_trained_steps >= max_steps:
+                        stop_training = True
+                        break
+
+                    print(f"[Step {total_trained_steps + 1}] Entraînement sur l'environnement : {env_name}")
+
+                    try:
+                        batch = next(iter_loaders[env_name])
+                    except StopIteration:
+                        iter_loaders[env_name] = iter(dataloaders[env_name])
+                        batch = next(iter_loaders[env_name])
+
+                    batch = {k: v.to(self.args.device) for k, v in batch.items()}
+
+                    optimizers[env_name].zero_grad()
+
+                    self.model.train()
+
+                    for name, head in self.model.lm_heads.items():
+                        if name != env_name:
+                            for param in head.parameters():
+                                param.requires_grad = False
+
+                    for param in shared_encoder.parameters():
+                        param.requires_grad = False
+
+                    with torch.amp.autocast("cuda"):
+                        outputs = self.model(**batch, env_name=env_name)
+                        loss = outputs.loss
+
+                    step_loss = loss.item()
+                    env_epoch_losses[env_name].append(step_loss)
+                    round_loss_sum += step_loss
+                    round_loss_count += 1
+                    print(f"    Loss pour l'environnement {env_name}: {step_loss:.4f}")
+
+                    scaler.scale(loss).backward(retain_graph=True)
+
+                    for param in shared_encoder.parameters():
+                        param.requires_grad = True
+                    for name, head in self.model.lm_heads.items():
+                        if name != env_name:
+                            for param in head.parameters():
+                                param.requires_grad = True
+                    
+                    # Clipping des gradients si nécessaire
+                    if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
+                        scaler.unscale_(optimizers[env_name])
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+
+                    scaler.step(optimizers[env_name])
+                    scaler.update()
+                    
+                    lr_schedulers[env_name].step()
+
+                    phi_batches.append((batch, env_name))
+                    phi_update_counter += 1
+
+
+                    if phi_update_counter % update_phi_every_k == 0:
+                        optimizer.zero_grad()
+                        phi_accum_loss = 0
+
+                        for batch_phi, env_phi_name in phi_batches:
+                            batch_phi = {k: v.to(self.args.device) for k, v in batch_phi.items()}
+                            with torch.amp.autocast("cuda"):
+                                outputs_phi = self.model(**batch_phi, env_name=env_phi_name)
+                                loss_phi = outputs_phi.loss
+                            phi_accum_loss = phi_accum_loss + loss_phi
+
+                        scaler.scale(phi_accum_loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+                        lr_scheduler.step()
+
+                        phi_batches = []
+                        phi_update_counter = 0
+                        total_trained_steps += 1
+
+                        if total_trained_steps % log_interval == 0:
+                            eval_loss, perplexity = self.run_evaluation()
+                            if self.is_world_process_zero():
+                                log_path = os.path.join(self.args.output_dir, "training_log.csv")
+                                if total_trained_steps == log_interval and os.path.exists(log_path):
+                                    os.remove(log_path)
+                                if total_trained_steps == log_interval and not os.path.exists(log_path):
+                                    with open(log_path, "w") as f:
+                                        f.write("epoch,global_step,train_loss,val_loss,perplexity\n")
+                                with open(log_path, "a") as f:
+                                    f.write(f"{epoch + 1},{total_trained_steps},{round_loss_sum / max(1, round_loss_count):.4f},{eval_loss:.4f},{perplexity:.4f}\n")
+                                print(f"--> Résumé [Step {total_trained_steps}] : Eval Loss = {eval_loss:.4f}, Perplexity = {perplexity:.4f}")
+
+                            if eval_loss is not None and eval_loss < best_eval_loss:
+                                best_eval_loss = eval_loss
+                                best_model_path = os.path.join(self.args.output_dir, "best_model")
+                                self.model.save_pretrained(best_model_path, safe_serialization=False)
+                                print(f"Meilleur modèle sauvegardé à l'étape {total_trained_steps} avec eval_loss = {eval_loss:.4f}")
+
+                        if saving_heads and total_trained_steps % nb_steps_heads_saving == 0:
+                            self.save_heads(total_trained_steps)
+                        if saving_intermediary_models and total_trained_steps % nb_steps_model_saving == 0:
+                            self.save_intermediary_model(total_trained_steps)
+
+                    if stop_training:
+                        break
+
+                if round_loss_count > 0:
+                    avg_round_loss = round_loss_sum / round_loss_count
+                else:
+                    avg_round_loss = 0.0
+
+                print(f"----- Fin du round {round_idx + 1}/{num_rounds_per_epoch}: Loss moyenne sur ce round = {avg_round_loss:.4f} -----\n")
+
+                if self.is_world_process_zero():
+                    with open(csv_file, "a", newline="") as f:
+                        writer = csv.writer(f)
+                        row = [epoch + 1]
+                        for env_name in training_set.keys():
+                            losses = env_epoch_losses[env_name]
+                            avg_loss = sum(losses) / len(losses) if losses else ""
+                            row.append(avg_loss)
+                        writer.writerow(row)
+
+                if stop_training:
+                    break
+
+            print(f"===== Fin de l'ÉPOQUE {epoch + 1}/{num_train_epochs} =====")
+
+        print("Entraînement terminé. Nombre total de steps:", total_trained_steps)
+
+
+
+
     def save_intermediary_model(self, n_steps):
         fname = os.path.join(self.args.output_dir, f"model-{n_steps}")
         self.save_model(output_dir=fname)
@@ -920,9 +1199,34 @@ class InvariantTrainer(transformers.Trainer):
             else DistributedSampler(train_dataset)
         )
 
+        # --- Début de la modif ---
+        def safe_collate_fn(examples):
+            input_ids = torch.stack([torch.tensor(example["input_ids"]) for example in examples])
+            attention_mask = torch.stack([torch.tensor(example["attention_mask"]) for example in examples])
+
+            # 🚨 Nouveau contrôle simple
+            valid_examples = [
+                (ids, mask) for ids, mask in zip(input_ids, attention_mask)
+                if mask.sum() > 10  # ou 5 si tu veux vraiment être large
+            ]
+
+            if len(valid_examples) == 0:
+                print("⚠️ Batch vide : aucune séquence valide trouvée.")
+                return None  # batch vide => ignoré
+
+            input_ids, attention_mask = zip(*valid_examples)
+            input_ids = torch.stack(input_ids)
+            attention_mask = torch.stack(attention_mask)
+
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+            }
+        # --- Fin de la modif ---
+
         return DataLoader(
             train_dataset,
             batch_size=self.args.train_batch_size,
             sampler=train_sampler,
-            collate_fn=self.data_collator
+            collate_fn=safe_collate_fn,
         )

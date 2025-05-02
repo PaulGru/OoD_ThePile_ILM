@@ -20,17 +20,23 @@ https://huggingface.co/models?filter=masked-lm
 import logging
 import math
 import os
-import csv
 import sys
 import torch
 from dataclasses import dataclass, field
 from typing import Optional
 
 from datasets import load_dataset
+from torch.utils.data import DataLoader
+from tqdm import tqdm 
 
 from invariant_trainer import InvariantTrainer
+
 from invariant_roberta import InvariantRobertaForMaskedLM, InvariantRobertaConfig
 from invariant_distilbert import InvariantDistilBertForMaskedLM, InvariantDistilBertConfig
+from invariant_xlmroberta import InvariantXLMRobertaForMaskedLM, InvariantXLMRobertaConfig
+
+from transformers.models.xlm_roberta.tokenization_xlm_roberta_fast import XLMRobertaTokenizerFast
+from transformers.models.xlm_roberta.tokenization_xlm_roberta import XLMRobertaTokenizer
 
 import transformers
 from transformers import (
@@ -58,12 +64,15 @@ MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 CONFIG_MAPPING.update({'invariant-distilbert': InvariantDistilBertConfig})
 CONFIG_MAPPING.update({'invariant-roberta': InvariantRobertaConfig})
+CONFIG_MAPPING.update({'invariant-xlm-roberta': InvariantXLMRobertaConfig})
 
 MODEL_FOR_MASKED_LM_MAPPING.update({InvariantDistilBertConfig: InvariantDistilBertForMaskedLM})
 MODEL_FOR_MASKED_LM_MAPPING.update({InvariantRobertaConfig: InvariantRobertaForMaskedLM})
+MODEL_FOR_MASKED_LM_MAPPING.update({InvariantXLMRobertaConfig: InvariantXLMRobertaForMaskedLM})
 
 TOKENIZER_MAPPING.update({InvariantDistilBertConfig: (DistilBertTokenizer, DistilBertTokenizerFast)})
 TOKENIZER_MAPPING.update({InvariantRobertaConfig: (RobertaTokenizer, RobertaTokenizerFast)})
+TOKENIZER_MAPPING.update({InvariantXLMRobertaConfig: (XLMRobertaTokenizer, XLMRobertaTokenizerFast)})
 
 @dataclass
 class ModelArguments:
@@ -131,6 +140,18 @@ class ModelArguments:
     attention_dropout: float = field(
         default=0.1,
         metadata={"help": "Taux de dropout pour l'attention."}
+    )
+    irm_games_mode: Optional[str] = field(
+        default="simplified",
+        metadata={
+            "help": "Choix entre 'simplified' pour update phi à chaque batch (ILM) ou 'full' pour IRM-Games complet."
+        }
+    )
+    update_phi_every_k: Optional[int] = field(
+        default=5,  # Valeur par défaut raisonnable
+        metadata={
+            "help": "Nombre d'updates des têtes w^e avant une mise à jour du backbone phi dans l'entraînement IRM-Games."
+        }
     )
 
 @dataclass
@@ -363,16 +384,28 @@ def main():
 
     if len(envs) > 1:
         if 'envs' not in config.to_dict():
-            if 'distil' in model_args.model_name_or_path:
+
+            if model_args.model_type == "invariant-distilbert":
                 config_dict = config.to_dict()
                 config_dict.pop("envs", None)
                 inv_config = InvariantDistilBertConfig(envs=envs, **config_dict)
                 irm_model = InvariantDistilBertForMaskedLM(inv_config, model)
-            else:
+
+            elif model_args.model_type == "invariant-xlm-roberta":
+                config_dict = config.to_dict()
+                config_dict.pop("envs", None)
+                inv_config = InvariantXLMRobertaConfig(envs=envs, **config_dict)
+                irm_model = InvariantXLMRobertaForMaskedLM(inv_config, model)
+
+            elif model_args.model_type == "invariant-roberta":
                 config_dict = config.to_dict()
                 config_dict.pop("envs", None)
                 inv_config = InvariantRobertaConfig(envs=envs, **config_dict)
                 irm_model = InvariantRobertaForMaskedLM(inv_config, model)
+
+            else:
+                raise ValueError(f"Unknown model_type: {model_args.model_type}")
+
         else:
             irm_model = model
     else:
@@ -502,14 +535,24 @@ def main():
             )
         elif model_args.mode == "iLM":
             print("TRAINING WITH INVARIANCE -- FOLLOWING IRM-GAMES DYNAMIC")
-            train_result = trainer.invariant_train(
-                training_set=irm_tokenized_train,
-                nb_steps=nb_steps,
-                nb_steps_heads_saving=model_args.nb_steps_heads_saving,
-                nb_steps_model_saving=model_args.nb_steps_model_saving,
-                num_train_epochs=training_args.num_train_epochs,
-            )
-        
+            if model_args.irm_games_mode == "full":
+                train_result = trainer.invariant_train_games(
+                    training_set=irm_tokenized_train,
+                    nb_steps=nb_steps,
+                    nb_steps_heads_saving=model_args.nb_steps_heads_saving,
+                    nb_steps_model_saving=model_args.nb_steps_model_saving,
+                    num_train_epochs=training_args.num_train_epochs,
+                    update_phi_every_k=model_args.update_phi_every_k  # si tu ajoutes ce paramètre
+                )
+            else:  # mode simplifié
+                train_result = trainer.invariant_train(
+                    training_set=irm_tokenized_train,
+                    nb_steps=nb_steps,
+                    nb_steps_heads_saving=model_args.nb_steps_heads_saving,
+                    nb_steps_model_saving=model_args.nb_steps_model_saving,
+                    num_train_epochs=training_args.num_train_epochs,
+                )
+
         output_dir = training_args.output_dir
         trainer.model.save_pretrained(output_dir, safe_serialization=False)
         trainer.processing_class.save_pretrained(output_dir)
@@ -529,22 +572,28 @@ def main():
         best_model_path = os.path.join(training_args.output_dir, "best_model")
         if os.path.isdir(best_model_path):
             print("Rechargement du meilleur modèle sauvegardé pour l'évaluation.")
-            # Si le mode est "eLM", c'est un modèle classique, sinon c'est un modèle invariant multi-têtes.
+
             if model_args.mode == "eLM":
+                # Si c'est eLM (standard fine-tuning), on recharge normalement
                 best_model = AutoModelForMaskedLM.from_pretrained(best_model_path)
             else:
-                best_model = InvariantDistilBertForMaskedLM.from_pretrained(best_model_path)
+                # Sinon on recharge un modèle invariant spécifique
+                if model_args.model_type == "invariant-distilbert":
+                    best_model = InvariantDistilBertForMaskedLM.from_pretrained(best_model_path)
+                elif model_args.model_type == "invariant-roberta":
+                    best_model = InvariantRobertaForMaskedLM.from_pretrained(best_model_path)
+                elif model_args.model_type == "invariant-xlm-roberta":
+                    best_model = InvariantXLMRobertaForMaskedLM.from_pretrained(best_model_path)
+                else:
+                    raise ValueError(f"Unknown invariant model_type: {model_args.model_type}")
+
             best_model.to(training_args.device)
             trainer.model = best_model  # Remplacer le modèle courant par le meilleur modèle
         else:
             print("Aucun modèle 'best_model' trouvé, on utilise le modèle final.")
             best_model = trainer.model
             best_model.to(training_args.device)
-
         
-
-        from torch.utils.data import DataLoader
-        from tqdm import tqdm 
 
         # Création du DataLoader pour l'évaluation. On utilise ici la taille de batch définie pour l'évaluation.
         eval_dataloader = DataLoader(

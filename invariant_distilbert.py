@@ -1,4 +1,5 @@
 import copy
+import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 from transformers.modeling_outputs import MaskedLMOutput
@@ -168,8 +169,24 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
 
         
         elif env_name is not None:
-            lm_head = self.lm_heads[env_name]
-            prediction_scores = lm_head(sequence_output)    
+            n_heads = len(self.lm_heads)
+
+            # Faire passer la tête de l'environnement courant AVEC gradients
+            own_logits = self.lm_heads[env_name](sequence_output)
+
+            # Initialiser la somme avec la tête active
+            sum_logits = own_logits.clone()
+
+            # Ajouter les autres têtes SANS gradients
+            for name, head in self.lm_heads.items():
+                if name == env_name:
+                    continue
+                with torch.no_grad():
+                    logits = head(sequence_output)
+                sum_logits = sum_logits + logits  # <-- pas inplace !
+
+            # Calcul final de la moyenne
+            prediction_scores = sum_logits / n_heads
 
         else:
             prediction_scores = 0.
