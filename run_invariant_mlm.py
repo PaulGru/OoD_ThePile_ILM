@@ -153,6 +153,11 @@ class ModelArguments:
             "help": "Nombre d'updates des têtes w^e avant une mise à jour du backbone phi dans l'entraînement IRM-Games."
         }
     )
+    do_bias_eval_on_wikitext: Optional[bool] = field(
+        default=False,
+        metadata={"help": "If True, run bias evaluation using Wikitext-2 val_ood after training."}
+    )
+
 
 @dataclass
 class DataTrainingArguments:

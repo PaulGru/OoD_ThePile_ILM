@@ -44,7 +44,7 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
         # Si la configuration n'a pas l'attribut "envs", on l'initialise avec une valeur par défaut, par exemple ["all_train"].
         if not hasattr(config, "envs"):
             config.envs = ["all_train"]
-        # Vous pouvez également vous assurer que config.envs est une liste non vide.
+        # assurer que config.envs est une liste non vide.
         if len(config.envs) == 0:
             config.envs = ["all_train"]
 
@@ -183,7 +183,7 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
                     continue
                 with torch.no_grad():
                     logits = head(sequence_output)
-                sum_logits = sum_logits + logits  # <-- pas inplace !
+                sum_logits = sum_logits + logits
 
             # Calcul final de la moyenne
             prediction_scores = sum_logits / n_heads
