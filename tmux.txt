@@ -1,0 +1,6 @@
+tmux new -s nom_de_session
+on lance le code, pour détacher la session : Ctrl+b d
+tmux attach -t nom_de_session
+
+Pour lister toutes les sections avrtices : tmux ls
+Renommer la session active : entrer en command mode (Ctrl+b) et taper rename-session nouveau_nom
