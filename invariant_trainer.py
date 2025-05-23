@@ -1154,8 +1154,6 @@ class InvariantTrainer(transformers.Trainer):
         print("Entraînement terminé. Nombre total de steps:", total_trained_steps)
 
 
-
-
     def save_intermediary_model(self, n_steps):
         fname = os.path.join(self.args.output_dir, f"model-{n_steps}")
         self.save_model(output_dir=fname)
