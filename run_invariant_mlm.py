@@ -231,7 +231,7 @@ def main():
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
         
     nb_steps = data_args.nb_steps
-    #training_args.local_rank = -1
+    training_args.local_rank = -1
 
     # Force local_rank à -1 si non défini (on n'utilise pas le training distribué)
     #if training_args.local_rank is None:
@@ -508,7 +508,6 @@ def main():
         model=irm_model,
         args=training_args,
         eval_dataset=tokenized_eval_dataset if training_args.do_eval else None,
-        processing_class=tokenizer,
         data_collator=data_collator,
     )
 
@@ -560,7 +559,7 @@ def main():
 
         output_dir = training_args.output_dir
         trainer.model.save_pretrained(output_dir, safe_serialization=False)
-        trainer.processing_class.save_pretrained(output_dir)
+        tokenizer.save_pretrained(output_dir)
         
         output_train_file = os.path.join(training_args.output_dir, "train_results.txt")
         if trainer.is_world_process_zero():

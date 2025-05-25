@@ -1197,34 +1197,9 @@ class InvariantTrainer(transformers.Trainer):
             else DistributedSampler(train_dataset)
         )
 
-        # --- Début de la modif ---
-        def safe_collate_fn(examples):
-            input_ids = torch.stack([torch.tensor(example["input_ids"]) for example in examples])
-            attention_mask = torch.stack([torch.tensor(example["attention_mask"]) for example in examples])
-
-            # 🚨 Nouveau contrôle simple
-            valid_examples = [
-                (ids, mask) for ids, mask in zip(input_ids, attention_mask)
-                if mask.sum() > 10  # ou 5 si tu veux vraiment être large
-            ]
-
-            if len(valid_examples) == 0:
-                print("⚠️ Batch vide : aucune séquence valide trouvée.")
-                return None  # batch vide => ignoré
-
-            input_ids, attention_mask = zip(*valid_examples)
-            input_ids = torch.stack(input_ids)
-            attention_mask = torch.stack(attention_mask)
-
-            return {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-            }
-        # --- Fin de la modif ---
-
         return DataLoader(
             train_dataset,
             batch_size=self.args.train_batch_size,
             sampler=train_sampler,
-            collate_fn=safe_collate_fn,
+            collate_fn=self.data_collator,
         )
