@@ -231,7 +231,7 @@ def main():
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
         
     nb_steps = data_args.nb_steps
-    training_args.local_rank = -1
+    #training_args.local_rank = -1
 
     # Force local_rank à -1 si non défini (on n'utilise pas le training distribué)
     #if training_args.local_rank is None:

@@ -8,37 +8,41 @@ from itertools import product
 import pandas as pd
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Force l'utilisation du premier GPU
+#os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Force l'utilisation du premier GPU
 
 # ------------------ CONFIG ------------------
-learning_rates = [5e-5] # [1e-6, 1e-5, 5e-5, 1e-4]
-seeds = [2, 3] # [0, 1, 2, 3]
+learning_rates = [1e-6, 1e-5, 5e-5]
+seeds = [0, 1, 2]
 nb_steps = [250, 500, 1000, 2500]
 
-base_dir = "runs_ilm"
-train_file = "data/train_env"
+base_dir = "runs_elm" # runs_ilm
+train_file = "data/train_shuffled.txt" #/train_env
 val_file = "data/val_test"
 
 # ------------------ TRAINING ------------------
 def launch_training():
     os.makedirs(base_dir, exist_ok=True)
     for lr, seed, step in product(learning_rates, seeds, nb_steps):
-        exp_name = f"ilm_lr{lr}_seed{seed}_steps{step}"
+        exp_name = f"elm_lr{lr}_seed{seed}_steps{step}" #ilm
         out_dir = os.path.join(base_dir, exp_name)
         os.makedirs(out_dir, exist_ok=True)
 
+        # "python3", "run_invariant_mlm.py",
         cmd = [
-            "python3", "run_invariant_mlm.py",
+            "python3", "-m", "torch.distributed.run",
+            "--nproc_per_node=2", "run_invariant_mlm.py",
             "--train_file", train_file,
             "--validation_file", val_file,
             "--model_name_or_path", "distilbert-base-uncased",
-            "--model_type", "invariant-distilbert",
+            "--model_type", "distilbert",
             "--tokenizer_name", "distilbert-base-uncased",
             "--do_train", "--do_eval",
             "--output_dir", out_dir,
             "--overwrite_output_dir",
-            "--per_device_train_batch_size", "8",
-            "--gradient_accumulation_steps", "2",
+            "--mode", "elm",
+            "--per_device_train_batch_size", "24",
+            "--gradient_accumulation_steps", "4",
+            "--preprocessing_num_workers", "16",
             "--learning_rate", str(lr),
             "--nb_steps", str(step),
             "--fp16",
