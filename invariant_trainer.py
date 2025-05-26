@@ -141,7 +141,7 @@ class InvariantTrainer(transformers.Trainer):
         scaler = torch.amp.GradScaler('cuda')
 
         total_trained_steps = 0
-        log_interval = 180  # On log tous les 5 steps
+        log_interval = 50  # On log tous les 5 steps
         best_eval_loss = float("inf")
 
         print("=== Début de l'entraînement eLM (avec AMP) ===")
