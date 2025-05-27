@@ -231,7 +231,7 @@ def main():
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
         
     nb_steps = data_args.nb_steps
-    #training_args.local_rank = -1
+    training_args.local_rank = -1
 
     # Force local_rank à -1 si non défini (on n'utilise pas le training distribué)
     #if training_args.local_rank is None:
@@ -298,6 +298,7 @@ def main():
                             env_name = file.split(".")[0]
                             if env_name == "all_train":
                                 continue
+
                             data_files = {"train": os.path.join(train_folder, file)}
                             train_datasets[env_name] = load_dataset("text", data_files=data_files)
                         
@@ -520,23 +521,7 @@ def main():
                 nb_steps=data_args.nb_steps,
                 num_train_epochs=training_args.num_train_epochs,
             )
-        elif model_args.mode == "mtLM":
-            print("TRAINING WITH DIVERSITY -- NOT FOLLOWING IRM-GAMES DYNAMIC")
-            train_result = trainer.multitask_train(
-                training_set=irm_tokenized_train,
-                nb_steps=nb_steps,
-                nb_steps_model_saving=model_args.nb_steps_model_saving,
-                num_train_epochs=training_args.num_train_epochs,
-            )
-        elif model_args.mode == "ensLM":
-            print("TRAINING WITH ENSEMBLE -- NOT FOLLOWING IRM-GAMES DYNAMIC")
-            train_result = trainer.ensemble_train(
-                training_set=irm_tokenized_train,
-                nb_steps=nb_steps,
-                nb_steps_heads_saving=model_args.nb_steps_heads_saving,
-                nb_steps_model_saving=model_args.nb_steps_model_saving,
-                num_train_epochs=training_args.num_train_epochs,
-            )
+        
         elif model_args.mode == "iLM":
             print("TRAINING WITH INVARIANCE -- FOLLOWING IRM-GAMES DYNAMIC")
             if model_args.irm_games_mode == "full":
