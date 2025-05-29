@@ -210,7 +210,7 @@ class DataTrainingArguments:
             if self.validation_file is None:
                 raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
 
-# Fonction d'ordre supérieur pour créer la fonction de regroupement des textes
+# Fonction de regroupement des textes
 def create_group_texts(max_seq_length):
     def group_texts(examples):
         concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
@@ -267,42 +267,22 @@ def main():
     # Chargement des datasets d'entraînement
     if training_args.do_train:
         if data_args.train_file is not None:
-            # data_args.train_file doit pointer vers le dossier "train_env"
-            if os.path.isdir(data_args.train_file):
+            if os.path.isdir(data_args.train_file): # on vérifie si le chemin mène à un répertoire
+                # iLM prend plusieurs environnements, on charge les fichiers d'entraînement par environnement
                 train_folder = data_args.train_file
-                print("Contenu de train_env :", os.listdir(train_folder))
+                print("Contenu de train_env :", os.listdir(train_folder)) # liste les éléments du dossier
                 train_datasets = {}
                 
-                if model_args.mode == "eLM":
-                    # eLM doit avoir exactement un environnement global
-                    all_train_path = os.path.join(train_folder, "all_train.txt")
-                    if os.path.exists(all_train_path):
-                        data_files = {"train": all_train_path}
-                        dataset = load_dataset("text", data_files=data_files)
-                        train_datasets = {"all_train": dataset}
-                    else:
-                        # Fusion explicite de tous les fichiers d'environnements
-                        merged_file_path = os.path.join(train_folder, "merged_all_train.txt")
-                        with open(merged_file_path, 'w', encoding='utf-8') as outfile:
-                            for fname in os.listdir(train_folder):
-                                if fname.endswith('.txt'):
-                                    with open(os.path.join(train_folder, fname), encoding='utf-8') as infile:
-                                        for line in infile:
-                                            outfile.write(line)
-                        dataset = load_dataset("text", data_files={"train": merged_file_path})
-                        train_datasets = {"all_train": dataset}
-                else:
-                    # iLM/ensLM : chargement normal par environnement
-                    for file in os.listdir(train_folder):
-                        if file.endswith('.txt'):
-                            env_name = file.split(".")[0]
-                            if env_name == "all_train":
-                                continue
+                for file in os.listdir(train_folder):
+                    if file.endswith('.txt'):
+                        env_name = file.split(".")[0]
+                        if env_name == "all_train":
+                            continue
 
-                            data_files = {"train": os.path.join(train_folder, file)}
-                            train_datasets[env_name] = load_dataset("text", data_files=data_files)
-                        
-            else:
+                        data_files = {"train": os.path.join(train_folder, file)}
+                        train_datasets[env_name] = load_dataset("text", data_files=data_files)
+                     
+            else: # si c'est un fichier unique, c'est pour eLM
                 data_files = {"train": data_args.train_file}
                 dataset = load_dataset("text", data_files=data_files)
                 train_datasets = {"all_train": dataset}
@@ -316,10 +296,9 @@ def main():
         else:
             envs = list(train_datasets.keys())
 
-    else:
+    else: # Mode évaluation uniquement
         train_datasets = {}
-        # Mode évaluation uniquement ; définir envs à une valeur par défaut.
-        envs = []  # ou éventuellement envs = ['default'] si votre modèle en a besoin
+        envs = []
 
     # Chargement de la validation depuis le dossier "val_env"
     if training_args.do_eval:
@@ -329,7 +308,7 @@ def main():
                 eval_datasets = {}
                 for file in os.listdir(val_folder):
                     if file.endswith('.txt'):
-                        env_name = file.split(".")[0]  # attend "val_ind" ou "val_ood"
+                        env_name = file.split(".")[0]  # attend "val_ind" ou "val_ood", on supprime .txt
                         data_files = {"validation": os.path.join(val_folder, file)}
                         eval_datasets[env_name] = load_dataset("text", data_files=data_files)
             else:
@@ -384,29 +363,20 @@ def main():
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForMaskedLM.from_config(config)
-    
-    model.config.dropout = 0.25
-    model.config.attention_dropout = 0.25
 
-    if len(envs) > 1:
+    if len(envs) > 1: # Signifie que l'on est dans le cas iLM
         if 'envs' not in config.to_dict():
 
             if model_args.model_type == "invariant-distilbert":
-                config_dict = config.to_dict()
-                config_dict.pop("envs", None)
-                inv_config = InvariantDistilBertConfig(envs=envs, **config_dict)
+                inv_config = InvariantDistilBertConfig(envs=envs, **config.to_dict())
                 irm_model = InvariantDistilBertForMaskedLM(inv_config, model)
 
             elif model_args.model_type == "invariant-xlm-roberta":
-                config_dict = config.to_dict()
-                config_dict.pop("envs", None)
-                inv_config = InvariantXLMRobertaConfig(envs=envs, **config_dict)
+                inv_config = InvariantXLMRobertaConfig(envs=envs, **config.to_dict())
                 irm_model = InvariantXLMRobertaForMaskedLM(inv_config, model)
 
             elif model_args.model_type == "invariant-roberta":
-                config_dict = config.to_dict()
-                config_dict.pop("envs", None)
-                inv_config = InvariantRobertaConfig(envs=envs, **config_dict)
+                inv_config = InvariantRobertaConfig(envs=envs, **config.to_dict())
                 irm_model = InvariantRobertaForMaskedLM(inv_config, model)
 
             else:
@@ -421,12 +391,8 @@ def main():
 
     # Vérification du nombre de têtes du modèle (important pour le mode eLM)
     num_heads = len(irm_model.lm_heads) if hasattr(irm_model, 'lm_heads') else "Standard (une tête)"
-    print(f"[DEBUG] Nombre de têtes du modèle en mode {model_args.mode} : {num_heads}")
+    print(f"Nombre de têtes du modèle en mode {model_args.mode} : {num_heads}")
 
-    # AJOUT : enregistrement des hooks de débogage pour identifier les NaNs
-    #from hooks import register_nan_forward_hooks, register_nan_backward_hooks
-    #register_nan_forward_hooks(irm_model)
-    #register_nan_backward_hooks(irm_model)
 
     # Pré-traitement des datasets d'entraînement : tokenisation et regroupement.
     irm_tokenized_train = {}
@@ -531,7 +497,7 @@ def main():
                     nb_steps_heads_saving=model_args.nb_steps_heads_saving,
                     nb_steps_model_saving=model_args.nb_steps_model_saving,
                     num_train_epochs=training_args.num_train_epochs,
-                    update_phi_every_k=model_args.update_phi_every_k  # si tu ajoutes ce paramètre
+                    update_phi_every_k=model_args.update_phi_every_k
                 )
             else:  # mode simplifié
                 train_result = trainer.invariant_train(
@@ -577,7 +543,7 @@ def main():
                     raise ValueError(f"Unknown invariant model_type: {model_args.model_type}")
 
             best_model.to(training_args.device)
-            trainer.model = best_model  # Remplacer le modèle courant par le meilleur modèle
+            trainer.model = best_model
         else:
             print("Aucun modèle 'best_model' trouvé, on utilise le modèle final.")
             best_model = trainer.model
