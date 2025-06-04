@@ -11,6 +11,7 @@ from transformers.models.distilbert.configuration_distilbert import DistilBertCo
 class DistilBertLMHead(nn.Module):
     """DistilBert Head for masked language modeling."""
 
+    # tête de prédiction, MLP ckassique
     def __init__(self, config):
         super().__init__()
         self.vocab_transform = nn.Linear(config.dim, config.dim)
@@ -18,14 +19,15 @@ class DistilBertLMHead(nn.Module):
         self.vocab_projector = nn.Linear(config.dim, config.vocab_size)
 
     def forward(self, features, **kwargs):
-        x = self.vocab_transform(features)  # (bs, seq_length, dim)
-        x = gelu(x)  # (bs, seq_length, dim)
-        x = self.vocab_layer_norm(x)  # (bs, seq_length, dim)
+        x = self.vocab_transform(features)
+        x = gelu(x)
+        x = self.vocab_layer_norm(x)
         x = self.vocab_projector(x)
 
         return x
 
 
+# On prend la config déjà définie pour DistilBert, mais on ajoute un attribut "envs" pour gérer les environnements.
 class InvariantDistilBertConfig(DistilBertConfig):
     model_type = "invariant-distilbert"
 
@@ -49,8 +51,8 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
             config.envs = ["all_train"]
 
         super().__init__(config)
+
         self.config = config
-        
         if config.is_decoder:
             logger.warning(
                 "If you want to use `RobertaForMaskedLM` make sure `config.is_decoder=False` for "
@@ -122,7 +124,6 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
-        env_name=None,
         **kwargs
     ):
         r"""
@@ -141,13 +142,7 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
             )
             labels = kwargs.pop("masked_lm_labels")
         
-        # Définir les mots-clés autorisés
-        allowed_kwargs = {"env_name"}
-
-        # Vérifier s'il y a des mots-clés inattendus
-        unexpected_kwargs = [key for key in kwargs.keys() if key not in allowed_kwargs]
-        if unexpected_kwargs:
-            raise AssertionError(f"Unexpected keyword arguments: {unexpected_kwargs}")
+        assert kwargs == {}, f"Unexpected keyword arguments: {list(kwargs.keys())}."
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -166,27 +161,6 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
         if self.n_environments == 1:
             lm_head = list(self.lm_heads.values())[0]
             prediction_scores = lm_head(sequence_output)
-
-        
-        elif env_name is not None:
-            n_heads = len(self.lm_heads)
-
-            # Faire passer la tête de l'environnement courant AVEC gradients
-            own_logits = self.lm_heads[env_name](sequence_output)
-
-            # Initialiser la somme avec la tête active
-            sum_logits = own_logits.clone()
-
-            # Ajouter les autres têtes SANS gradients
-            for name, head in self.lm_heads.items():
-                if name == env_name:
-                    continue
-                with torch.no_grad():
-                    logits = head(sequence_output)
-                sum_logits = sum_logits + logits
-
-            # Calcul final de la moyenne
-            prediction_scores = sum_logits / n_heads
 
         else:
             prediction_scores = 0.

@@ -22,6 +22,8 @@ import math
 import os
 import sys
 import torch
+import wandb
+import glob
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -89,12 +91,6 @@ class ModelArguments:
         default=None,
         metadata={"help": "If training from scratch, pass a model type from the list: " + ", ".join(MODEL_TYPES)},
     )
-    config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
-    )
-    tokenizer_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
-    )
     cache_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
@@ -102,28 +98,6 @@ class ModelArguments:
     use_fast_tokenizer: bool = field(
         default=True,
         metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
-    )
-    model_revision: str = field(
-        default="main",
-        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
-    )
-    use_auth_token: bool = field(
-        default=False,
-        metadata={
-            "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script with private models)."
-        },
-    )
-    init_head: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Re-initialize the language modeling heads to random weights before training"}
-    )
-    init_base: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Re-initialize the base language model (and thus the language modeling heads) before training"}
-    )
-    mode: Optional[str] = field(
-        default="iLM",
-        metadata={"help": "Whether to train the heads as an ensemble instead of following the IRM-games dynamics"}
     )
     nb_steps_heads_saving: Optional[int] = field(
         default=0,
@@ -153,24 +127,16 @@ class ModelArguments:
             "help": "Nombre d'updates des têtes w^e avant une mise à jour du backbone phi dans l'entraînement IRM-Games."
         }
     )
-    do_bias_eval_on_wikitext: Optional[bool] = field(
-        default=False,
-        metadata={"help": "If True, run bias evaluation using Wikitext-2 val_ood after training."}
-    )
-
 
 @dataclass
 class DataTrainingArguments:
     """
     Arguments pertaining to what data we are going to input our model for training and eval.
     """
-    dataset_name: Optional[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+    train_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "The input training data file (a text file or a directory)."}
     )
-    dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
-    )
-    train_file: Optional[str] = field(default=None, metadata={"help": "The input training data file (a text file or a directory)."})
     validation_file: Optional[str] = field(
         default=None,
         metadata={"help": "The input validation data file or directory (a text file or directory)."},
@@ -188,25 +154,17 @@ class DataTrainingArguments:
     mlm_probability: float = field(
         default=0.15, metadata={"help": "Ratio of tokens to mask for masked language modeling loss"}
     )
-    line_by_line: bool = field(
-        default=False,
-        metadata={"help": "Whether distinct lines of text in the dataset are to be handled as distinct sequences."}
-    )
-    pad_to_max_length: bool = field(
-        default=False,
-        metadata={"help": "Whether to pad all samples to `max_seq_length`."}
-    )
     nb_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Number of training steps."}
     )
-    eval_type: Optional[str] = field(
-        default="ind",
-        metadata={"help": "Type d'évaluation à utiliser: 'ind' pour InD ou 'ood' pour OoD"}
+    ood_validation_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "Fichier de validation Out-Of-Distribution (.txt) jamais vu à l'entraînement"}
     )
 
     def __post_init__(self):
-        if self.train_file is None and self.dataset_name is None:
+        if self.train_file is None:
             if self.validation_file is None:
                 raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
 
@@ -229,24 +187,20 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-        
+
+    wandb.init(
+        project="invariant-language-modeling",
+        name=training_args.run_name,
+        config={
+            "learning_rate": training_args.learning_rate,
+            "epochs": training_args.num_train_epochs,
+            "batch_size": training_args.per_device_train_batch_size,
+            "nb_steps": data_args.nb_steps
+        }
+    )
+           
     nb_steps = data_args.nb_steps
-    training_args.local_rank = -1
-
-    # Force local_rank à -1 si non défini (on n'utilise pas le training distribué)
-    #if training_args.local_rank is None:
-    #    training_args.local_rank = -1
-
-    # Détection du dernier checkpoint.
-    last_checkpoint = None
-    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
-            raise ValueError(
-                f"Output directory ({training_args.output_dir}) already exists and is not empty. Use --overwrite_output_dir to overcome."
-            )
-        elif last_checkpoint is not None:
-            logger.info(f"Checkpoint detected, resuming training at {last_checkpoint}.")
+    #training_args.local_rank = -1
 
     # Setup logging
     logging.basicConfig(
@@ -264,143 +218,79 @@ def main():
 
     set_seed(training_args.seed)
 
+    train_folder = data_args.train_file
+    datasets = {}
     # Chargement des datasets d'entraînement
     if training_args.do_train:
-        if data_args.train_file is not None:
-            if os.path.isdir(data_args.train_file): # on vérifie si le chemin mène à un répertoire
+        if train_folder is not None:
+            if os.path.isdir(train_folder): # on vérifie si le chemin mène à un répertoire
                 # iLM prend plusieurs environnements, on charge les fichiers d'entraînement par environnement
-                train_folder = data_args.train_file
                 print("Contenu de train_env :", os.listdir(train_folder)) # liste les éléments du dossier
-                train_datasets = {}
                 
                 for file in os.listdir(train_folder):
                     if file.endswith('.txt'):
                         env_name = file.split(".")[0]
-                        if env_name == "all_train":
-                            continue
-
                         data_files = {"train": os.path.join(train_folder, file)}
-                        train_datasets[env_name] = load_dataset("text", data_files=data_files)
+                        datasets[env_name] = load_dataset("text", data_files=data_files)
                      
             else: # si c'est un fichier unique, c'est pour eLM
                 data_files = {"train": data_args.train_file}
                 dataset = load_dataset("text", data_files=data_files)
-                train_datasets = {"all_train": dataset}
+                datasets = {"all_train": dataset}
         else:
             raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
-
-
-        # Définition de la variable envs à partir des clés de train_datasets.
-        if model_args.mode == "eLM":
-            envs = ["all_train"]  # Toujours un unique environnement explicite en eLM
-        else:
-            envs = list(train_datasets.keys())
-
-    else: # Mode évaluation uniquement
-        train_datasets = {}
-        envs = []
 
     # Chargement de la validation depuis le dossier "val_env"
     if training_args.do_eval:
         if data_args.validation_file is not None:
-            if os.path.isdir(data_args.validation_file):
-                val_folder = data_args.validation_file
-                eval_datasets = {}
-                for file in os.listdir(val_folder):
-                    if file.endswith('.txt'):
-                        env_name = file.split(".")[0]  # attend "val_ind" ou "val_ood", on supprime .txt
-                        data_files = {"validation": os.path.join(val_folder, file)}
-                        eval_datasets[env_name] = load_dataset("text", data_files=data_files)
-            else:
-                data_files = {"validation": data_args.validation_file}
-                eval_datasets = {"validation-file": load_dataset("text", data_files=data_files)}
+            data_files = {"validation": data_args.validation_file}
+            datasets["validation-file"] = load_dataset("text", data_files=data_files)
         else:
             raise ValueError("Aucun fichier de validation n'est spécifié pour l'évaluation.")
-
-        # Sélection du dataset de validation en fonction du paramètre eval_type
-        eval_key = f"val_{data_args.eval_type}"
-        if eval_key in eval_datasets:
-            selected_eval_dataset = eval_datasets[eval_key]["validation"]
-        else:
-            raise ValueError(f"Aucun dataset de validation correspondant à {eval_key} n'a été trouvé dans {data_args.validation_file}")
-    else:
-        selected_eval_dataset = None
-
+    
+        # Chargement de la validation Out-of-Distribution
+        if data_args.ood_validation_file is not None:
+            data_files = {"validation": data_args.ood_validation_file}
+            datasets["ood-validation"] = load_dataset("text", data_files=data_files)
+   
     # Configuration du modèle et du tokenizer
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
-        "revision": model_args.model_revision,
-        "use_auth_token": True if model_args.use_auth_token else None,
     }
-    if model_args.config_name:
-        config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
-    elif model_args.model_name_or_path:
-        config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
-    else:
-        config = CONFIG_MAPPING[model_args.model_type]()
-        logger.warning("You are instantiating a new config instance from scratch.")
-
+    config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
+    
     tokenizer_kwargs = {
-        "cache_dir": model_args.cache_dir,
+        "cache_dir": model_args.cache_dir, # répertoire où HuggingFace stock les fichiers téléchargés (tokenizer, vocab, etc.).
         "use_fast": model_args.use_fast_tokenizer,
-        "revision": model_args.model_revision,
-        "use_auth_token": True if model_args.use_auth_token else None,
     }
-    if model_args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
-    else:
-        raise ValueError("You are instantiating a new tokenizer from scratch. This is not supported by this script.")
-
-    if model_args.model_name_or_path:
-        model = AutoModelForMaskedLM.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
-    else:
-        logger.info("Training new model from scratch")
-        model = AutoModelForMaskedLM.from_config(config)
-
-    if len(envs) > 1: # Signifie que l'on est dans le cas iLM
-        if 'envs' not in config.to_dict():
-
-            if model_args.model_type == "invariant-distilbert":
-                inv_config = InvariantDistilBertConfig(envs=envs, **config.to_dict())
-                irm_model = InvariantDistilBertForMaskedLM(inv_config, model)
-
-            elif model_args.model_type == "invariant-xlm-roberta":
-                inv_config = InvariantXLMRobertaConfig(envs=envs, **config.to_dict())
-                irm_model = InvariantXLMRobertaForMaskedLM(inv_config, model)
-
-            elif model_args.model_type == "invariant-roberta":
-                inv_config = InvariantRobertaConfig(envs=envs, **config.to_dict())
-                irm_model = InvariantRobertaForMaskedLM(inv_config, model)
-
-            else:
-                raise ValueError(f"Unknown model_type: {model_args.model_type}")
-
+    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
+    
+    model = AutoModelForMaskedLM.from_pretrained(
+        model_args.model_name_or_path,
+        config=config,
+        cache_dir=model_args.cache_dir,
+    )
+ 
+    envs = [k for k in datasets.keys() if 'validation' not in k]
+    
+    if 'envs' not in config.to_dict():
+        if model_args.model_name_or_path:
+            inv_config = InvariantDistilBertConfig(envs=envs, **config.to_dict())
+            irm_model = InvariantDistilBertForMaskedLM(inv_config, model)
         else:
-            irm_model = model
+            raise ValueError("Modèle inconnu")
     else:
         irm_model = model
-
+    
     irm_model.resize_token_embeddings(len(tokenizer))
 
-    # Vérification du nombre de têtes du modèle (important pour le mode eLM)
-    num_heads = len(irm_model.lm_heads) if hasattr(irm_model, 'lm_heads') else "Standard (une tête)"
-    print(f"Nombre de têtes du modèle en mode {model_args.mode} : {num_heads}")
-
-
     # Pré-traitement des datasets d'entraînement : tokenisation et regroupement.
-    irm_tokenized_train = {}
-    for env_name, datasets in train_datasets.items():
-        if isinstance(datasets, dict):
+    irm_tokenized_datasets = {}
+    for env_name, datasets in datasets.items():
+        if training_args.do_train and 'validation' not in env_name:
             column_names = datasets["train"].column_names
-        else:
-            column_names = datasets.column_names
+        elif training_args.do_eval and 'validation' in env_name:
+            column_names = datasets["validation"].column_names
         text_column_name = "content" if "content" in column_names else column_names[0]
         
         # Calcul de max_seq_length pour l'entraînement
@@ -430,173 +320,103 @@ def main():
             num_proc=data_args.preprocessing_num_workers,
             load_from_cache_file=not data_args.overwrite_cache,
         )
-        irm_tokenized_train[env_name] = tokenized_datasets
+        irm_tokenized_datasets[env_name] = tokenized_datasets
 
-    print("Clés d'irm_tokenized_train :", list(irm_tokenized_train.keys()))
-
-    # Pré-traitement du dataset d'évaluation
-    if training_args.do_eval and selected_eval_dataset is not None:
-        column_names = selected_eval_dataset.column_names
-        text_column_name = "content" if "content" in column_names else column_names[0]
-
-        def tokenize_function_eval(examples):
-            return tokenizer(examples[text_column_name], return_special_tokens_mask=False)
-        
-        tokenized_eval_dataset = selected_eval_dataset.map(
-            tokenize_function_eval,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not data_args.overwrite_cache,
-        )
-        if data_args.max_seq_length is None:
-            eval_max_seq_length = tokenizer.model_max_length
-            if eval_max_seq_length > 1024:
-                logger.warn(f"eval_max_seq_length élevé ({tokenizer.model_max_length}), on limite à 1024.")
-                eval_max_seq_length = 1024
-        else:
-            eval_max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
-        
-        group_texts_eval_fn = create_group_texts(eval_max_seq_length)
-        tokenized_eval_dataset = tokenized_eval_dataset.map(
-            group_texts_eval_fn,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            load_from_cache_file=not data_args.overwrite_cache,
-        )
-    else:
-        tokenized_eval_dataset = None
+    print("Clés d'irm_tokenized_datasets :", list(irm_tokenized_datasets.keys()))
 
     # Data collator pour MLM
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=data_args.mlm_probability)
     
+    train_tokenized_datasets = {k: v for k, v in irm_tokenized_datasets.items() if 'validation-file' not in k and 'ood-validation' not in k}
+    eval_tokenized_datasets = irm_tokenized_datasets['validation-file']['validation']
+    eval_ood_tokenized_datasets = irm_tokenized_datasets["ood-validation"]["validation"]
+
     # Initialisation du Trainer
     trainer = InvariantTrainer(
         model=irm_model,
         args=training_args,
-        eval_dataset=tokenized_eval_dataset if training_args.do_eval else None,
+        eval_dataset=eval_tokenized_datasets if training_args.do_eval else None,
         data_collator=data_collator,
     )
 
-    # Entraînement
     if training_args.do_train:
-        if model_args.mode == "eLM":
-            print("Entraînement eLM (fine tuning classique)")
-            train_result = trainer.empirical_train(
-                training_set=irm_tokenized_train,  # dans ce cas, training_set devrait contenir une unique clé "all_train"
-                nb_steps=data_args.nb_steps,
+        if model_args.irm_games_mode == "full":
+            train_result = trainer.invariant_train_games(
+                training_set=train_tokenized_datasets,
+                nb_steps=nb_steps,
+                nb_steps_heads_saving=model_args.nb_steps_heads_saving,
+                nb_steps_model_saving=model_args.nb_steps_model_saving,
+                num_train_epochs=training_args.num_train_epochs,
+                update_phi_every_k=model_args.update_phi_every_k
+            )
+        else:  # mode simplifié
+            train_result = trainer.invariant_train(
+                training_set=train_tokenized_datasets,
+                nb_steps=nb_steps,
+                nb_steps_heads_saving=model_args.nb_steps_heads_saving,
+                nb_steps_model_saving=model_args.nb_steps_model_saving,
                 num_train_epochs=training_args.num_train_epochs,
             )
-        
-        elif model_args.mode == "iLM":
-            print("TRAINING WITH INVARIANCE -- FOLLOWING IRM-GAMES DYNAMIC")
-            if model_args.irm_games_mode == "full":
-                train_result = trainer.invariant_train_games(
-                    training_set=irm_tokenized_train,
-                    nb_steps=nb_steps,
-                    nb_steps_heads_saving=model_args.nb_steps_heads_saving,
-                    nb_steps_model_saving=model_args.nb_steps_model_saving,
-                    num_train_epochs=training_args.num_train_epochs,
-                    update_phi_every_k=model_args.update_phi_every_k
-                )
-            else:  # mode simplifié
-                train_result = trainer.invariant_train(
-                    training_set=irm_tokenized_train,
-                    nb_steps=nb_steps,
-                    nb_steps_heads_saving=model_args.nb_steps_heads_saving,
-                    nb_steps_model_saving=model_args.nb_steps_model_saving,
-                    num_train_epochs=training_args.num_train_epochs,
-                )
 
         output_dir = training_args.output_dir
-        trainer.model.save_pretrained(output_dir, safe_serialization=False)
-        tokenizer.save_pretrained(output_dir)
-        
-        output_train_file = os.path.join(training_args.output_dir, "train_results.txt")
+        trainer.model.save_pretrained(output_dir, safe_serialization=False) # sauvegarde le modèle
+        tokenizer.save_pretrained(output_dir) # sauvegarde le tokenizer
+
         if trainer.is_world_process_zero():
-            with open(output_train_file, "w") as writer:
-                logger.info("***** Train results *****")
+            logger.info("***** Train results *****")
+            for key, value in sorted(train_result["metrics"].items()):
+                logger.info(f"  {key} = {value}")
+
+            wandb.log({f"final/{key}": value for key, value in train_result["metrics"].items()})
             trainer.state.save_to_json(os.path.join(training_args.output_dir, "trainer_state.json"))
+    
 
-    # Évaluation
-    results = {}
-    if training_args.do_eval:
-        logger.info("*** Evaluate ***")
+    # Préparer l'évaluation OOD (à faire AVANT cette boucle)
+    ood_eval_dataset = eval_ood_tokenized_datasets  # <- assure-toi que ce dataset a été préparé !
 
-        # Charger le meilleur modèle sauvegardé (celui avec la meilleure eval loss sur InD)
-        best_model_path = os.path.join(training_args.output_dir, "best_model")
-        if os.path.isdir(best_model_path):
-            print("Rechargement du meilleur modèle sauvegardé pour l'évaluation.")
+    if trainer.is_world_process_zero():
+        checkpoints = sorted(glob.glob(os.path.join(training_args.output_dir, "model-*")))
 
-            if model_args.mode == "eLM":
-                # Si c'est eLM (standard fine-tuning), on recharge normalement
-                best_model = AutoModelForMaskedLM.from_pretrained(best_model_path)
-            else:
-                # Sinon on recharge un modèle invariant spécifique
-                if model_args.model_type == "invariant-distilbert":
-                    best_model = InvariantDistilBertForMaskedLM.from_pretrained(best_model_path)
-                elif model_args.model_type == "invariant-roberta":
-                    best_model = InvariantRobertaForMaskedLM.from_pretrained(best_model_path)
-                elif model_args.model_type == "invariant-xlm-roberta":
-                    best_model = InvariantXLMRobertaForMaskedLM.from_pretrained(best_model_path)
-                else:
-                    raise ValueError(f"Unknown invariant model_type: {model_args.model_type}")
+        for checkpoint_path in checkpoints:
+            step = int(checkpoint_path.split("-")[-1])
 
-            best_model.to(training_args.device)
-            trainer.model = best_model
-        else:
-            print("Aucun modèle 'best_model' trouvé, on utilise le modèle final.")
-            best_model = trainer.model
-            best_model.to(training_args.device)
+            # Recharger le modèle depuis le checkpoint
+            model = InvariantDistilBertForMaskedLM.from_pretrained(checkpoint_path)
+            trainer.model = model  # Mise à jour du modèle
+
+            # Évaluation In-Distribution
+            eval_output = trainer.evaluate(eval_dataset=eval_tokenized_datasets)
+            eval_loss = eval_output["eval_loss"]
+            perplexity = math.exp(eval_loss)
+
+            wandb.log({
+                "eval_in/loss": eval_loss,
+                "eval_in/perplexity": perplexity,
+                "eval_in/step": step
+            })
+
+            # Évaluation OOD
+            if ood_eval_dataset is not None:
+                ood_output = trainer.evaluate(eval_dataset=ood_eval_dataset)
+                ood_loss = ood_output["eval_loss"]
+                ood_perplexity = math.exp(ood_loss)
+
+                wandb.log({
+                    "eval_ood/loss": ood_loss,
+                    "eval_ood/perplexity": ood_perplexity,
+                    "eval_ood/step": step
+                })
+
         
+    if trainer.is_world_process_zero():
+        if wandb.run:
+            wandb.finish()
 
-        # Création du DataLoader pour l'évaluation. On utilise ici la taille de batch définie pour l'évaluation.
-        eval_dataloader = DataLoader(
-            tokenized_eval_dataset,
-            batch_size=training_args.per_device_eval_batch_size,
-            collate_fn=data_collator
-        )
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
-        # Passage du modèle en mode evaluation
-        trainer.model.eval()
-        total_eval_loss = 0.0
-        nb_eval_steps = 0
-
-        # Boucle d'évaluation avec torch.no_grad() et AMP
-        with torch.no_grad():
-            pbar = tqdm(eval_dataloader, desc="Évaluation", unit="batch")
-            for batch in pbar:
-                # Déplacement des tensors sur le device
-                batch = {k: v.to(training_args.device) for k, v in batch.items()}
-                # Calcul en mode AMP
-                with torch.amp.autocast("cuda"):
-                    outputs = best_model(**batch)
-                    loss = outputs.loss
-                total_eval_loss += loss.item()
-                nb_eval_steps += 1
-                # Mise à jour de la barre de progression avec la loss du batch courant
-                pbar.set_postfix(loss=f"{loss.item():.4f}")
-
-
-        # Calcul de la loss moyenne et de la perplexité
-        avg_eval_loss = total_eval_loss / nb_eval_steps if nb_eval_steps > 0 else 0.0
-        # Pour éviter des valeurs aberrantes, on teste si la loss moyenne est raisonnable pour calculer l'exponentielle
-        perplexity = math.exp(avg_eval_loss) if avg_eval_loss < 100 else float('inf')
-        results = {"eval_loss": avg_eval_loss, "perplexity": perplexity}
-
-
-        print("***** Eval results *****")
-        for key, value in sorted(results.items()):
-            print(f"{key} = {value:.4f}")
-
-        output_eval_file = os.path.join(training_args.output_dir, "eval_results_mlm.txt")
-        if trainer.is_world_process_zero():
-            with open(output_eval_file, "w") as writer:
-                logger.info("***** Eval results *****")
-                for key, value in sorted(results.items()):
-                    logger.info(f"  {key} = {value}")
-                    writer.write(f"{key} = {value}\n")
-    return results
 
 if __name__ == "__main__":
     main()

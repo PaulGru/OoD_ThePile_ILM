@@ -11,8 +11,8 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Force l'utilisation du premier GPU
 
 # ------------------ CONFIG ------------------
-learning_rates = [1e-6, 1e-5, 5e-5]
-seeds = [0, 1, 2]
+learning_rates = [1e-5, 5e-5]
+seeds = [0, 1, 2, 3]
 nb_steps = [250, 500, 1000, 2500]
 
 base_dir = "runs_ilm" # runs_elm
