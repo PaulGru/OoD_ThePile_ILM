@@ -187,17 +187,19 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    
+    if training_args.local_rank != -1:
+        torch.cuda.set_device(training_args.local_rank)
 
-    wandb.init(
-        project="invariant-language-modeling",
-        name=training_args.run_name,
-        config={
-            "learning_rate": training_args.learning_rate,
-            "epochs": training_args.num_train_epochs,
-            "batch_size": training_args.per_device_train_batch_size,
-            "nb_steps": data_args.nb_steps
-        }
-    )
+    if is_main_process(training_args.local_rank):
+        wandb.init(
+            project="invariant-language-modeling",
+            name=training_args.run_name,
+            config={
+                "seed": training_args.seed,
+                "learning_rate": training_args.learning_rate,
+            }
+        )
            
     nb_steps = data_args.nb_steps
     #training_args.local_rank = -1
@@ -367,54 +369,80 @@ def main():
             for key, value in sorted(train_result["metrics"].items()):
                 logger.info(f"  {key} = {value}")
 
-            wandb.log({f"final/{key}": value for key, value in train_result["metrics"].items()})
+            wandb.log({
+                f"final/{key}": value for key, value in train_result["metrics"].items()
+            })
             trainer.state.save_to_json(os.path.join(training_args.output_dir, "trainer_state.json"))
     
 
-    # Préparer l'évaluation OOD (à faire AVANT cette boucle)
-    ood_eval_dataset = eval_ood_tokenized_datasets  # <- assure-toi que ce dataset a été préparé !
-
-    if trainer.is_world_process_zero():
         checkpoints = sorted(glob.glob(os.path.join(training_args.output_dir, "model-*")))
 
-        for checkpoint_path in checkpoints:
-            step = int(checkpoint_path.split("-")[-1])
+    if wandb.run:
+        wandb.finish()
 
-            # Recharger le modèle depuis le checkpoint
-            model = InvariantDistilBertForMaskedLM.from_pretrained(checkpoint_path)
-            trainer.model = model  # Mise à jour du modèle
+    
+    if trainer.is_world_process_zero():
+        print(f"Nombre de checkpoints à évaluer : {len(checkpoints)}")
 
-            # Évaluation In-Distribution
-            eval_output = trainer.evaluate(eval_dataset=eval_tokenized_datasets)
-            eval_loss = eval_output["eval_loss"]
-            perplexity = math.exp(eval_loss)
+    iterator = tqdm(checkpoints, desc="Évaluation des checkpoints") if trainer.is_world_process_zero() else checkpoints
 
+
+    # Nouveau run W&B pour l'évaluation
+    if is_main_process(training_args.local_rank):
+        wandb.init(
+            project="invariant-language-modeling",
+            name=f"{training_args.run_name}_eval",
+            config={"base_run": training_args.run_name, "evaluation_only": True}
+        )
+
+        wandb.define_metric("eval_in/step")
+        wandb.define_metric("eval_in/perplexity", step_metric="eval_in/step")
+        wandb.define_metric("eval_in/loss", step_metric="eval_in/step")
+        wandb.define_metric("eval_ood/step")
+        wandb.define_metric("eval_ood/perplexity", step_metric="eval_ood/step")
+        wandb.define_metric("eval_ood/loss", step_metric="eval_ood/step")
+
+    for checkpoint_path in iterator:
+        step = int(checkpoint_path.split("-")[-1])
+
+        # Recharger le modèle depuis le checkpoint
+        model = InvariantDistilBertForMaskedLM.from_pretrained(checkpoint_path).to(training_args.device)
+        trainer.model = model  # Mise à jour du modèle
+        print("modèle chargé depuis le checkpoint :", checkpoint_path)
+
+        # Évaluation In-Distribution
+        eval_output = trainer.evaluate(eval_dataset=eval_tokenized_datasets)
+        eval_loss = eval_output["eval_loss"]
+        perplexity = math.exp(eval_loss)
+
+        if trainer.is_world_process_zero():
+            print(f"[Step {step}] In-Distribution - Loss: {eval_loss:.4f}, Perplexity: {perplexity:.4f}")
             wandb.log({
+                "eval_in/step": step,
                 "eval_in/loss": eval_loss,
-                "eval_in/perplexity": perplexity,
-                "eval_in/step": step
+                "eval_in/perplexity": perplexity
             })
 
-            # Évaluation OOD
-            if ood_eval_dataset is not None:
-                ood_output = trainer.evaluate(eval_dataset=ood_eval_dataset)
-                ood_loss = ood_output["eval_loss"]
-                ood_perplexity = math.exp(ood_loss)
-
+        # Évaluation OOD
+        if eval_ood_tokenized_datasets is not None:
+            ood_output = trainer.evaluate(eval_dataset=eval_ood_tokenized_datasets)
+            ood_loss = ood_output["eval_loss"]
+            ood_perplexity = math.exp(ood_loss)
+            
+            if trainer.is_world_process_zero():
+                print(f"[Step {step}] OOD - Loss: {ood_loss:.4f}, Perplexity: {ood_perplexity:.4f}")
                 wandb.log({
+                    "eval_ood/step": step,
                     "eval_ood/loss": ood_loss,
-                    "eval_ood/perplexity": ood_perplexity,
-                    "eval_ood/step": step
+                    "eval_ood/perplexity": ood_perplexity
                 })
 
-        
-    if trainer.is_world_process_zero():
-        if wandb.run:
-            wandb.finish()
+    if wandb.run:
+        wandb.finish()
 
     import torch.distributed as dist
     if dist.is_initialized():
-        dist.barrier()
+    #    dist.barrier()
         dist.destroy_process_group()
 
 

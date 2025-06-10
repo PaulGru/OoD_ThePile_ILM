@@ -129,7 +129,7 @@ class InvariantTrainer(transformers.Trainer):
 
         saving_heads = bool(nb_steps_heads_saving > 0)
         saving_intermediary_models = bool(nb_steps_model_saving > 0)
-        total_trained_steps = 0
+        self.state.global_step = 0
         cumulative_loss = 0.0
         cumulative_count = 0
 
@@ -145,7 +145,7 @@ class InvariantTrainer(transformers.Trainer):
             for round_idx in tqdm(range(num_update_steps_per_epoch)):
 
                 for env_name in training_set.keys():
-                    if total_trained_steps >= max_steps :
+                    if self.state.global_step >= max_steps :
                         break
 
                     try:
@@ -181,22 +181,22 @@ class InvariantTrainer(transformers.Trainer):
                     lr_scheduler.step()
                     lr_schedulers[env_name].step()
 
-                    total_trained_steps += 1
+                    self.state.global_step += 1
                     cumulative_loss += loss.item()
                     cumulative_count += 1
 
-                    if self.is_world_process_zero() and total_trained_steps % 50 == 0:
-                        wandb.log({
-                            "train_loss": loss.item(),
-                        })
+                    if self.is_world_process_zero() and self.state.global_step % nb_steps_model_saving == 0:
+                        wandb.log(
+                            {"training/train_loss": loss.item(),},
+                        step=self.state.global_step)
 
-                    if saving_heads and total_trained_steps % nb_steps_heads_saving == 0:
-                        self.save_heads(total_trained_steps)
-                    if saving_intermediary_models and total_trained_steps % nb_steps_model_saving == 0:
-                        self.save_intermediary_model(total_trained_steps)
+                    if saving_heads and self.state.global_step % nb_steps_heads_saving == 0:
+                        self.save_heads(self.state.global_step)
+                    if saving_intermediary_models and self.state.global_step % nb_steps_model_saving == 0:
+                        self.save_intermediary_model(self.state.global_step)
                     
                 
-        print("=== Entraînement du modèle terminé. Nombre total de rounds:", total_trained_steps/len(training_set.keys()))
+        print("=== Entraînement du modèle terminé. Nombre total de rounds:", self.state.global_step/len(training_set.keys()))
         
         average_loss = cumulative_loss / cumulative_count if cumulative_count > 0 else float('inf')
         return {"metrics": {"train_loss": average_loss}}
@@ -266,7 +266,7 @@ class InvariantTrainer(transformers.Trainer):
         print("Nombre total d'exemples traités approximativement :", total_train_batch_size * max_steps)
         print(min_train_set_size)
 
-        total_trained_steps = 0
+        self.state.global_step = 0
         phi_accum_loss = 0
         phi_update_counter = 0
         phi_batches = []
@@ -303,11 +303,11 @@ class InvariantTrainer(transformers.Trainer):
                 print(f"----- Début du round {round_idx + 1}/{num_rounds_per_epoch} : Mise à jour de tous les environnements -----")
 
                 for env_name in training_set.keys():
-                    if total_trained_steps >= max_steps:
+                    if self.state.global_step >= max_steps:
                         stop_training = True
                         break
 
-                    print(f"[Step {total_trained_steps + 1}] Entraînement sur l'environnement : {env_name}")
+                    print(f"[Step {self.state.global_step + 1}] Entraînement sur l'environnement : {env_name}")
 
                     try:
                         batch = next(iter_loaders[env_name])
@@ -380,31 +380,31 @@ class InvariantTrainer(transformers.Trainer):
 
                         phi_batches = []
                         phi_update_counter = 0
-                        total_trained_steps += 1
+                        self.state.global_step += 1
 
-                        if total_trained_steps % log_interval == 0:
+                        if self.state.global_step % log_interval == 0:
                             eval_loss, perplexity = self.run_evaluation()
                             if self.is_world_process_zero():
                                 log_path = os.path.join(self.args.output_dir, "training_log.csv")
-                                if total_trained_steps == log_interval and os.path.exists(log_path):
+                                if self.state.global_step == log_interval and os.path.exists(log_path):
                                     os.remove(log_path)
-                                if total_trained_steps == log_interval and not os.path.exists(log_path):
+                                if self.state.global_step == log_interval and not os.path.exists(log_path):
                                     with open(log_path, "w") as f:
                                         f.write("epoch,global_step,train_loss,val_loss,perplexity\n")
                                 with open(log_path, "a") as f:
-                                    f.write(f"{epoch + 1},{total_trained_steps},{round_loss_sum / max(1, round_loss_count):.4f},{eval_loss:.4f},{perplexity:.4f}\n")
-                                print(f"--> Résumé [Step {total_trained_steps}] : Eval Loss = {eval_loss:.4f}, Perplexity = {perplexity:.4f}")
+                                    f.write(f"{epoch + 1},{self.state.global_step},{round_loss_sum / max(1, round_loss_count):.4f},{eval_loss:.4f},{perplexity:.4f}\n")
+                                print(f"--> Résumé [Step {self.state.global_step}] : Eval Loss = {eval_loss:.4f}, Perplexity = {perplexity:.4f}")
 
                             if eval_loss is not None and eval_loss < best_eval_loss:
                                 best_eval_loss = eval_loss
                                 best_model_path = os.path.join(self.args.output_dir, "best_model")
                                 self.model.save_pretrained(best_model_path, safe_serialization=False)
-                                print(f"Meilleur modèle sauvegardé à l'étape {total_trained_steps} avec eval_loss = {eval_loss:.4f}")
+                                print(f"Meilleur modèle sauvegardé à l'étape {self.state.global_step} avec eval_loss = {eval_loss:.4f}")
 
-                        if saving_heads and total_trained_steps % nb_steps_heads_saving == 0:
-                            self.save_heads(total_trained_steps)
-                        if saving_intermediary_models and total_trained_steps % nb_steps_model_saving == 0:
-                            self.save_intermediary_model(total_trained_steps)
+                        if saving_heads and self.state.global_step % nb_steps_heads_saving == 0:
+                            self.save_heads(self.state.global_step)
+                        if saving_intermediary_models and self.state.global_step % nb_steps_model_saving == 0:
+                            self.save_intermediary_model(self.state.global_step)
 
                     if stop_training:
                         break
@@ -431,7 +431,7 @@ class InvariantTrainer(transformers.Trainer):
 
             print(f"===== Fin de l'ÉPOQUE {epoch + 1}/{num_train_epochs} =====")
 
-        print("Entraînement terminé. Nombre total de steps:", total_trained_steps)
+        print("Entraînement terminé. Nombre total de steps:", self.state.global_step)
 
 
     def save_intermediary_model(self, n_steps):
