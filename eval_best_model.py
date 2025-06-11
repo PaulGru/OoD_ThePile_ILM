@@ -30,7 +30,6 @@ for run in run_dirs:
     cmd = [
         "python3", "run_invariant_mlm.py",
         "--model_name_or_path", best_model_path,
-        "--model_type", "distilbert", # invariant-distilbert
         "--tokenizer_name", "distilbert-base-uncased",
         "--validation_file", eval_file,
         "--output_dir", os.path.join(run_path, "ood_eval"),

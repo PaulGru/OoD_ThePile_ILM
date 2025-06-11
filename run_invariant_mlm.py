@@ -24,6 +24,7 @@ import sys
 import torch
 import wandb
 import glob
+import gc
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -164,9 +165,8 @@ class DataTrainingArguments:
     )
 
     def __post_init__(self):
-        if self.train_file is None:
-            if self.validation_file is None:
-                raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
+        if self.train_file is None and if self.validation_file is None:
+            raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
 
 # Fonction de regroupement des textes
 def create_group_texts(max_seq_length):
@@ -386,7 +386,6 @@ def main():
 
     iterator = tqdm(checkpoints, desc="Évaluation des checkpoints") if trainer.is_world_process_zero() else checkpoints
 
-
     # Nouveau run W&B pour l'évaluation
     if is_main_process(training_args.local_rank):
         wandb.init(
@@ -436,6 +435,11 @@ def main():
                     "eval_ood/loss": ood_loss,
                     "eval_ood/perplexity": ood_perplexity
                 })
+
+        trainer.model = None
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if wandb.run:
         wandb.finish()

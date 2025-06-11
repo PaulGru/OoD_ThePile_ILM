@@ -133,27 +133,22 @@ class InvariantTrainer(transformers.Trainer):
         cumulative_loss = 0.0
         cumulative_count = 0
 
-        iter_loaders = {}
-        for env_name in training_set.keys():
-            train_loader = dataloaders[env_name]
-            iter_loaders[env_name] = iter(train_loader)
-
         for epoch in range(int(num_train_epochs)):
             print(f"\n===== ÉPOQUE {epoch + 1}/{num_train_epochs} =====")
+
+            iter_loaders = {}
+            for env_name in training_set.keys():
+                train_loader = dataloaders[env_name]
+                iter_loaders[env_name] = iter(train_loader)
             
             # Un round correspond à une itération sur tous les environnements
             for round_idx in tqdm(range(num_update_steps_per_epoch)):
-
-                for env_name in training_set.keys():
-                    if self.state.global_step >= max_steps :
+                if self.state.global_step >= max_steps :
                         break
 
-                    try:
-                        batch = next(iter_loaders[env_name])
-                    except StopIteration:
-                        iter_loaders[env_name] = iter(dataloaders[env_name])
-                        batch = next(iter_loaders[env_name])
-
+                for env_name in training_set.keys():
+                    batch = next(iter_loaders[env_name])
+                
                     optimizer.zero_grad()
                     optimizers[env_name].zero_grad()
                     self.model.train()

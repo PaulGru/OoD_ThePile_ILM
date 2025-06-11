@@ -11,7 +11,7 @@ from transformers.models.distilbert.configuration_distilbert import DistilBertCo
 class DistilBertLMHead(nn.Module):
     """DistilBert Head for masked language modeling."""
 
-    # tête de prédiction, MLP ckassique
+    # tête de prédiction, MLP classique
     def __init__(self, config):
         super().__init__()
         self.vocab_transform = nn.Linear(config.dim, config.dim)
@@ -44,11 +44,11 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
     def __init__(self, config, model=None):  # , model, envs):
 
         # Si la configuration n'a pas l'attribut "envs", on l'initialise avec une valeur par défaut, par exemple ["all_train"].
-        if not hasattr(config, "envs"):
-            config.envs = ["all_train"]
+        #if not hasattr(config, "envs"):
+        #    config.envs = ["all_train"]
         # assurer que config.envs est une liste non vide.
-        if len(config.envs) == 0:
-            config.envs = ["all_train"]
+        #if len(config.envs) == 0:
+        #    config.envs = ["all_train"]
 
         super().__init__(config)
 
@@ -83,6 +83,9 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
         for env_name, lm_head in self.lm_heads.items():
             self.__setattr__(env_name + '_head', self.lm_heads[env_name])
 
+        self.encoder.to('cuda')
+        for _, lm_head in self.lm_heads.items():
+            lm_head.to('cuda')
         
         self.n_environments = len(self.lm_heads)
 
@@ -161,7 +164,6 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
         if self.n_environments == 1:
             lm_head = list(self.lm_heads.values())[0]
             prediction_scores = lm_head(sequence_output)
-
         else:
             prediction_scores = 0.
             for lm_head in self.lm_heads.values():

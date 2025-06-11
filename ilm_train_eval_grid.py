@@ -8,11 +8,11 @@ from itertools import product
 import pandas as pd
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # GPU 0 eLM, GPU 1 iLM
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # GPU 0 eLM, GPU 1 iLM
 
 # ------------------ CONFIG ------------------
 learning_rates = [1e-5] # [5e-5]
-seeds = [2, 3] # [0,1,]
+seeds = [2, 3]
 
 nb_steps = 7500
 save_steps = 500
@@ -49,7 +49,7 @@ def launch_training(model_key):
             cmd = [
                 "python3", "-m", "torch.distributed.run",
                 "--nproc_per_node=1",
-                "--master_port", "29501", # GPU 0 : 29501, GPU 1 : 29500
+                "--master_port", "29500", # GPU 0 : 29501, GPU 1 : 29500
                 "run_invariant_mlm.py",
                 "--model_name_or_path", "distilbert-base-uncased",
                 "--train_file", train_file,
@@ -77,5 +77,5 @@ def launch_training(model_key):
 
 if __name__ == "__main__":
     t0 = time.time()
-    launch_training("ilm") # "elm"
+    launch_training("elm") # "ilm"
     print(f"[DONE] Temps total : {round(time.time() - t0, 2)}s")
