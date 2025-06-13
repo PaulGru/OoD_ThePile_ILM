@@ -25,6 +25,7 @@ import torch
 import wandb
 import glob
 import gc
+import torch.distributed as dist
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -123,7 +124,7 @@ class ModelArguments:
         }
     )
     update_phi_every_k: Optional[int] = field(
-        default=5,  # Valeur par défaut raisonnable
+        default=5,
         metadata={
             "help": "Nombre d'updates des têtes w^e avant une mise à jour du backbone phi dans l'entraînement IRM-Games."
         }
@@ -155,6 +156,13 @@ class DataTrainingArguments:
     mlm_probability: float = field(
         default=0.15, metadata={"help": "Ratio of tokens to mask for masked language modeling loss"}
     )
+    pad_to_max_length: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to pad all samples to `max_seq_length`. "
+            "If False, will pad the samples dynamically when batching to the maximum length in the batch."
+        },
+    )
     nb_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Number of training steps."}
@@ -165,7 +173,7 @@ class DataTrainingArguments:
     )
 
     def __post_init__(self):
-        if self.train_file is None and if self.validation_file is None:
+        if self.train_file is None and self.validation_file is None:
             raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
 
 # Fonction de regroupement des textes
@@ -193,16 +201,12 @@ def main():
 
     if is_main_process(training_args.local_rank):
         wandb.init(
-            project="invariant-language-modeling",
+            project="invariant-language-models-5e-05",
             name=training_args.run_name,
-            config={
-                "seed": training_args.seed,
-                "learning_rate": training_args.learning_rate,
-            }
+            config=training_args.to_dict()
         )
            
     nb_steps = data_args.nb_steps
-    #training_args.local_rank = -1
 
     # Setup logging
     logging.basicConfig(
@@ -254,6 +258,8 @@ def main():
         if data_args.ood_validation_file is not None:
             data_files = {"validation": data_args.ood_validation_file}
             datasets["ood-validation"] = load_dataset("text", data_files=data_files)
+        else:
+            raise ValueError("Aucun fichier de validation hors distribution n'est spécifié pour l'évaluation.")
    
     # Configuration du modèle et du tokenizer
     config_kwargs = {
@@ -305,7 +311,7 @@ def main():
             max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
         
         def tokenize_function(examples):
-            return tokenizer(examples[text_column_name], return_special_tokens_mask=False)
+            return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
         
         tokenized_datasets = datasets.map(
             tokenize_function,
@@ -314,10 +320,19 @@ def main():
             remove_columns=column_names,
             load_from_cache_file=not data_args.overwrite_cache,
         )
-        # Création de la fonction group_texts avec max_seq_length capturé
-        group_texts_fn = create_group_texts(max_seq_length)
+
+        def group_texts(examples):
+            concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+            total_length = len(concatenated_examples[list(examples.keys())[0]])    
+            total_length = (total_length // max_seq_length) * max_seq_length
+            result = {
+                k: [t[i: i + max_seq_length] for i in range(0, total_length, max_seq_length)]
+                for k, t in concatenated_examples.items()
+            }
+            return result
+        
         tokenized_datasets = tokenized_datasets.map(
-            group_texts_fn,
+            group_texts,
             batched=True,
             num_proc=data_args.preprocessing_num_workers,
             load_from_cache_file=not data_args.overwrite_cache,
@@ -338,6 +353,7 @@ def main():
         model=irm_model,
         args=training_args,
         eval_dataset=eval_tokenized_datasets if training_args.do_eval else None,
+        tokenizer=tokenizer, # à comparer
         data_collator=data_collator,
     )
 
@@ -363,90 +379,55 @@ def main():
         output_dir = training_args.output_dir
         trainer.model.save_pretrained(output_dir, safe_serialization=False) # sauvegarde le modèle
         tokenizer.save_pretrained(output_dir) # sauvegarde le tokenizer
-
-        if trainer.is_world_process_zero():
-            logger.info("***** Train results *****")
-            for key, value in sorted(train_result["metrics"].items()):
-                logger.info(f"  {key} = {value}")
-
-            wandb.log({
-                f"final/{key}": value for key, value in train_result["metrics"].items()
-            })
-            trainer.state.save_to_json(os.path.join(training_args.output_dir, "trainer_state.json"))
     
+        if trainer.is_world_process_zero() and wandb.run:
+            wandb.finish()
+        if trainer.is_world_process_zero() and training_args.do_eval:
+            wandb.init(
+                project="invariant-language-models-5e-05",
+                name=f"{training_args.run_name}-eval",
+                config=training_args.to_dict(),
+                reinit=True
+            )
 
-        checkpoints = sorted(glob.glob(os.path.join(training_args.output_dir, "model-*")))
-
-    if wandb.run:
-        wandb.finish()
-
-    
-    if trainer.is_world_process_zero():
-        print(f"Nombre de checkpoints à évaluer : {len(checkpoints)}")
-
+    checkpoints = sorted(glob.glob(os.path.join(training_args.output_dir, "model-*")))
     iterator = tqdm(checkpoints, desc="Évaluation des checkpoints") if trainer.is_world_process_zero() else checkpoints
-
-    # Nouveau run W&B pour l'évaluation
-    if is_main_process(training_args.local_rank):
-        wandb.init(
-            project="invariant-language-modeling",
-            name=f"{training_args.run_name}_eval",
-            config={"base_run": training_args.run_name, "evaluation_only": True}
-        )
-
-        wandb.define_metric("eval_in/step")
-        wandb.define_metric("eval_in/perplexity", step_metric="eval_in/step")
-        wandb.define_metric("eval_in/loss", step_metric="eval_in/step")
-        wandb.define_metric("eval_ood/step")
-        wandb.define_metric("eval_ood/perplexity", step_metric="eval_ood/step")
-        wandb.define_metric("eval_ood/loss", step_metric="eval_ood/step")
 
     for checkpoint_path in iterator:
         step = int(checkpoint_path.split("-")[-1])
 
         # Recharger le modèle depuis le checkpoint
         model = InvariantDistilBertForMaskedLM.from_pretrained(checkpoint_path).to(training_args.device)
-        trainer.model = model  # Mise à jour du modèle
-        print("modèle chargé depuis le checkpoint :", checkpoint_path)
+        trainer.model = model
+        if trainer.is_world_process_zero():
+            print("modèle chargé depuis le checkpoint :", checkpoint_path)
 
         # Évaluation In-Distribution
-        eval_output = trainer.evaluate(eval_dataset=eval_tokenized_datasets)
-        eval_loss = eval_output["eval_loss"]
-        perplexity = math.exp(eval_loss)
-
-        if trainer.is_world_process_zero():
-            print(f"[Step {step}] In-Distribution - Loss: {eval_loss:.4f}, Perplexity: {perplexity:.4f}")
-            wandb.log({
-                "eval_in/step": step,
-                "eval_in/loss": eval_loss,
-                "eval_in/perplexity": perplexity
-            })
+        ind_output = trainer.evaluate(eval_dataset=eval_tokenized_datasets)
+        ind_loss = ind_output["eval_loss"]
+        ind_perplexity = math.exp(ind_loss)
 
         # Évaluation OOD
         if eval_ood_tokenized_datasets is not None:
             ood_output = trainer.evaluate(eval_dataset=eval_ood_tokenized_datasets)
             ood_loss = ood_output["eval_loss"]
             ood_perplexity = math.exp(ood_loss)
-            
-            if trainer.is_world_process_zero():
-                print(f"[Step {step}] OOD - Loss: {ood_loss:.4f}, Perplexity: {ood_perplexity:.4f}")
-                wandb.log({
-                    "eval_ood/step": step,
-                    "eval_ood/loss": ood_loss,
-                    "eval_ood/perplexity": ood_perplexity
-                })
+        
+        if trainer.is_world_process_zero():
+            wandb.log({
+                "eval_in/loss": ind_loss,
+                "eval_in/perplexity": ind_perplexity,
+                "eval_ood/loss": ood_loss,
+                "eval_ood/perplexity": ood_perplexity
+            }, step=step)
 
         trainer.model = None
         del model
-        gc.collect()
-        torch.cuda.empty_cache()
 
     if wandb.run:
         wandb.finish()
 
-    import torch.distributed as dist
     if dist.is_initialized():
-    #    dist.barrier()
         dist.destroy_process_group()
 
 

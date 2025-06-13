@@ -125,7 +125,7 @@ class InvariantTrainer(transformers.Trainer):
             self.model = torch.nn.DataParallel(self.model)
 
         # Initialisation du scaler pour AMP
-        scaler = torch.amp.GradScaler("cuda")
+        scaler = torch.amp.GradScaler()
 
         saving_heads = bool(nb_steps_heads_saving > 0)
         saving_intermediary_models = bool(nb_steps_model_saving > 0)
@@ -155,7 +155,7 @@ class InvariantTrainer(transformers.Trainer):
 
                    # Forward avec logits moyennés (toutes les têtes) et AMP
                     with torch.amp.autocast("cuda"):
-                        #batch = {k: v.to(self.args.device) for k, v in batch.items() if torch.is_tensor(v)}
+                        batch = {k: v.to(self.args.device) for k, v in batch.items() if torch.is_tensor(v)}
                         outputs = self.model(**batch)
                         loss = outputs.loss
 
@@ -176,9 +176,10 @@ class InvariantTrainer(transformers.Trainer):
                     cumulative_count += 1
 
                     if self.is_world_process_zero() and self.state.global_step % nb_steps_model_saving == 0:
-                        wandb.log(
-                            {"training/train_loss": loss.item(),},
-                        step=self.state.global_step)
+                        wandb.log({
+                            "training/train_loss": loss.item(),},
+                            step=self.state.global_step
+                        )
 
                     if saving_heads and self.state.global_step % nb_steps_heads_saving == 0:
                         self.save_heads(self.state.global_step)
@@ -226,15 +227,16 @@ class InvariantTrainer(transformers.Trainer):
             optimizers[env_name] = optimizer_env
             lr_schedulers[env_name] = lr_scheduler_env
 
-        optimizer, lr_scheduler = self.create_optimizer_and_scheduler(self.model.encoder, num_training_steps=max_steps)
+        optimizer, lr_scheduler = self.create_optimizer_and_scheduler(
+            self.model.encoder,
+            num_training_steps=max_steps
+        )
 
         if self.args.n_gpu > 0:
             self.model.to(self.args.device)
         if self.args.n_gpu > 1:
             self.model = torch.nn.DataParallel(self.model)
-        
-        # Initialisation du scaler pour AMP
-        scaler = torch.amp.GradScaler("cuda")
+        scaler = torch.amp.GradScaler()
 
         saving_heads = bool(nb_steps_heads_saving > 0)
         saving_intermediary_models = bool(nb_steps_model_saving > 0)
@@ -244,9 +246,24 @@ class InvariantTrainer(transformers.Trainer):
         phi_update_counter = 0
         phi_batches = []
 
+        def freeze_heads_and_backbone(current_env):
+            for p in self.model.encoder.parameters():
+                p.requires_grad = False
+            for env, head in self.model.lm_heads.items():
+                for p in head.parameters():
+                    p.requires_grad = (env == current_env)
+
+        def unfreeze_all():
+            for p in self.model.encoder.parameters():
+                p.requires_grad = True
+            for head in self.model.lm_heads.values():
+                for p in head.parameters():
+                    p.requires_grad = True
+
+        self.model.train()
         for epoch in range(int(num_train_epochs)):
-            print(f"===== DÉBUT DE L'ÉPOQUE {epoch + 1}/{num_train_epochs} =====")
-            
+            if self.is_world_process_zero():
+                print(f"===== DÉBUT DE L'ÉPOQUE {epoch + 1}/{num_train_epochs} =====")
             iter_loaders = {env_name: iter(dataloaders[env_name]) for env_name in training_set.keys()}
 
             for round_idx in range(num_update_steps_per_epoch):
@@ -255,68 +272,64 @@ class InvariantTrainer(transformers.Trainer):
 
                 for env_name in training_set.keys():
                     batch = next(iter_loaders[env_name])
-                    
+                    freeze_heads_and_backbone(env_name)
                     optimizers[env_name].zero_grad()
-                    self.model.train()
 
-                    for name, head in self.model.lm_heads.items():
-                        if name != env_name:
-                            for param in head.parameters():
-                                param.requires_grad = False
-
-                    for param in self.model.encoder.parameters():
-                        param.requires_grad = False
-
+                    batch = {k: v.to(self.args.device) for k, v in batch.items() if torch.is_tensor(v)}
                     with torch.amp.autocast("cuda"):
-                        #batch = {k: v.to(self.args.device) for k, v in batch.items() if torch.is_tensor(v)}
                         outputs = self.model(**batch)
-                        loss = outputs.loss
+                        loss_head = outputs.loss
 
-                    scaler.scale(loss).backward(retain_graph=True)
-
-                    for param in self.model.encoder.parameters():
-                        param.requires_grad = True
-                    for name, head in self.model.lm_heads.items():
-                        if name != env_name:
-                            for param in head.parameters():
-                                param.requires_grad = True
-                    
+                    scaler.scale(loss_head).backward()
+                    scaler.unscale_(optimizers[env_name])                
                     
                     scaler.step(optimizers[env_name])
                     scaler.update()
-                    
-                    lr_schedulers[env_name].step()
+                    if lr_schedulers[env_name]:
+                        lr_schedulers[env_name].step()
 
-                    phi_batches.append((batch, env_name))
+                    self.state.global_step += 1
                     phi_update_counter += 1
+                    cumulative_loss += loss_head.item()
+                    cumulative_count += 1
 
+                    if self.is_world_process_zero():
+                        if nb_steps_heads_saving and self.state.global_step % nb_steps_heads_saving == 0:
+                            self.save_heads(self.state.global_step)
+                        if nb_steps_model_saving and self.state.global_step % nb_steps_model_saving == 0:
+                            wandb.log({
+                                "training/train_loss": loss_head.item()},
+                                step=self.state.global_step
+                            )
+                            self.save_intermediary_model(self.state.global_step)
+                    
+                    phi_batches.append({k: v.detach().cpu() for k, v in batch.items()})
 
-                    if phi_update_counter % update_phi_every_k == 0:
+                    if phi_update_counter >= update_phi_every_k:
+                        unfreeze_all()
                         optimizer.zero_grad()
-                        phi_accum_loss = 0
+                        total_phi_loss = 0
 
-                        for batch_phi, env_phi_name in phi_batches:
+                        for batch_phi in phi_batches:
+                            batch_phi = {k: v.to(self.args.device) for k, v in batch_phi.items()}
                             with torch.amp.autocast("cuda"):
-                                #batch_phi = {k: v.to(self.args.device) for k, v in batch_phi.items()}
-                                outputs_phi = self.model(**batch_phi, env_name=env_phi_name)
-                                loss_phi = outputs_phi.loss
-                            phi_accum_loss = phi_accum_loss + loss_phi
+                                outputs_phi = self.model(**batch_phi)
+                                total_phi_loss += outputs_phi.loss
 
-                        scaler.scale(phi_accum_loss).backward()
+                        scaler.scale(total_phi_loss).backward()
+                        scaler.unscale_(optimizer)
                         scaler.step(optimizer)
                         scaler.update()
-                        lr_scheduler.step()
+                        if lr_scheduler:
+                            lr_scheduler.step()
 
-                        phi_batches = []
                         phi_update_counter = 0
-                        self.state.global_step += 1
-                            
-                        if saving_heads and self.state.global_step % nb_steps_heads_saving == 0:
-                            self.save_heads(self.state.global_step)
-                        if saving_intermediary_models and self.state.global_step % nb_steps_model_saving == 0:
-                            self.save_intermediary_model(self.state.global_step) 
+                        phi_batches.clear()
 
         print("Entraînement terminé. Nombre total de steps:", self.state.global_step)
+
+        average_loss = cumulative_loss / cumulative_count if cumulative_count > 0 else float('inf')
+        return {"metrics": {"train_loss": average_loss}}
 
 
     def save_intermediary_model(self, n_steps):

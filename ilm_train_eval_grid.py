@@ -11,11 +11,11 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # GPU 0 eLM, GPU 1 iLM
 
 # ------------------ CONFIG ------------------
-learning_rates = [1e-5] # [5e-5]
-seeds = [2, 3]
+learning_rates = [1e-5] # [1e-5]
+seeds = [0]
 
-nb_steps = 7500
-save_steps = 500
+nb_steps = 7000
+save_steps = 1000
 
 base_dirs = {
     "ilm": "runs_ilm",
@@ -43,7 +43,7 @@ def launch_training(model_key):
             out_dir = os.path.join(base_dir, exp_name)
             os.makedirs(out_dir, exist_ok=True)
 
-            print(f"\nLancement de l'entraînement: {exp_name}")
+            print(f"\n Lancement de l'entraînement: {exp_name}")
 
             # "python3",
             cmd = [
@@ -77,5 +77,5 @@ def launch_training(model_key):
 
 if __name__ == "__main__":
     t0 = time.time()
-    launch_training("elm") # "ilm"
+    launch_training("ilm") # "elm"
     print(f"[DONE] Temps total : {round(time.time() - t0, 2)}s")

@@ -5,7 +5,6 @@ import subprocess
 env = os.environ.copy()
 env["CUDA_VISIBLE_DEVICES"] = "0"
 
-# Dossier contenant les différents runs (chacun avec un best_model/)
 runs_dir = "runs_elm"
 eval_file = "data/val_test/val_ood.txt"
 results_file = "eval_elm_ood.csv"
