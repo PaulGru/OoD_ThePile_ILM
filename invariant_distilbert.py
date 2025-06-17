@@ -43,13 +43,6 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
 
     def __init__(self, config, model=None):  # , model, envs):
 
-        # Si la configuration n'a pas l'attribut "envs", on l'initialise avec une valeur par défaut, par exemple ["all_train"].
-        #if not hasattr(config, "envs"):
-        #    config.envs = ["all_train"]
-        # assurer que config.envs est une liste non vide.
-        #if len(config.envs) == 0:
-        #    config.envs = ["all_train"]
-
         super().__init__(config)
 
         self.config = config
@@ -83,9 +76,9 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
         for env_name, lm_head in self.lm_heads.items():
             self.__setattr__(env_name + '_head', self.lm_heads[env_name])
 
-        self.encoder.to('cuda')
-        for _, lm_head in self.lm_heads.items():
-            lm_head.to('cuda')
+        #self.encoder.to('cuda')
+        #for _, lm_head in self.lm_heads.items():
+        #    lm_head.to('cuda')
         
         self.n_environments = len(self.lm_heads)
 

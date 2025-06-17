@@ -14,7 +14,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # GPU 0 eLM, GPU 1 iLM
 learning_rates = [1e-5] # [1e-5]
 seeds = [0]
 
-nb_steps = 7000
+nb_steps = 3000
 save_steps = 1000
 
 base_dirs = {
@@ -45,7 +45,6 @@ def launch_training(model_key):
 
             print(f"\n Lancement de l'entraînement: {exp_name}")
 
-            # "python3",
             cmd = [
                 "python3", "-m", "torch.distributed.run",
                 "--nproc_per_node=1",

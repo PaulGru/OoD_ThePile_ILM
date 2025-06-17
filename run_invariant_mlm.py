@@ -156,6 +156,10 @@ class DataTrainingArguments:
     mlm_probability: float = field(
         default=0.15, metadata={"help": "Ratio of tokens to mask for masked language modeling loss"}
     )
+    line_by_line: bool = field(
+        default=False,
+        metadata={"help": "Whether to treat each line of the input files as a separate document."}
+    )
     pad_to_max_length: bool = field(
         default=False,
         metadata={
@@ -201,12 +205,27 @@ def main():
 
     if is_main_process(training_args.local_rank):
         wandb.init(
-            project="invariant-language-models-5e-05",
+            project="ILM",
             name=training_args.run_name,
             config=training_args.to_dict()
         )
            
     nb_steps = data_args.nb_steps
+
+    # Detecting last checkpoint.
+    last_checkpoint = None
+    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
+        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
+            raise ValueError(
+                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
+                "Use --overwrite_output_dir to overcome."
+            )
+        elif last_checkpoint is not None:
+            logger.info(
+                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
+                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
+            )
 
     # Setup logging
     logging.basicConfig(
@@ -310,36 +329,61 @@ def main():
         else:
             max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
         
-        def tokenize_function(examples):
-            return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
-        
-        tokenized_datasets = datasets.map(
-            tokenize_function,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not data_args.overwrite_cache,
-        )
+        if data_args.line_by_line:
+            # When using line_by_line, we just tokenize each nonempty line.
+            padding = "max_length" if data_args.pad_to_max_length else False
 
-        def group_texts(examples):
-            concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
-            total_length = len(concatenated_examples[list(examples.keys())[0]])    
-            total_length = (total_length // max_seq_length) * max_seq_length
-            result = {
-                k: [t[i: i + max_seq_length] for i in range(0, total_length, max_seq_length)]
-                for k, t in concatenated_examples.items()
-            }
-            return result
-        
-        tokenized_datasets = tokenized_datasets.map(
-            group_texts,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            load_from_cache_file=not data_args.overwrite_cache,
-        )
-        irm_tokenized_datasets[env_name] = tokenized_datasets
+            def tokenize_function(examples):
+                # Remove empty lines
+                examples["text"] = [line for line in examples["text"] if len(line) > 0 and not line.isspace()]
+                return tokenizer(
+                    examples["text"],
+                    padding=padding,
+                    truncation=True,
+                    max_length=max_seq_length,
+                    # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
+                    # receives the `special_tokens_mask`.
+                    return_special_tokens_mask=True,
+                )
 
-    print("Clés d'irm_tokenized_datasets :", list(irm_tokenized_datasets.keys()))
+            tokenized_datasets = datasets.map(
+                tokenize_function,
+                batched=True,
+                num_proc=data_args.preprocessing_num_workers,
+                remove_columns=[text_column_name],
+                load_from_cache_file=not data_args.overwrite_cache,
+            )
+            irm_tokenized_datasets[env_name] = tokenized_datasets
+
+        else:
+            def tokenize_function(examples):
+                return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
+            
+            tokenized_datasets = datasets.map(
+                tokenize_function,
+                batched=True,
+                num_proc=data_args.preprocessing_num_workers,
+                remove_columns=column_names,
+                load_from_cache_file=not data_args.overwrite_cache,
+            )
+
+            def group_texts(examples):
+                concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+                total_length = len(concatenated_examples[list(examples.keys())[0]])    
+                total_length = (total_length // max_seq_length) * max_seq_length
+                result = {
+                    k: [t[i: i + max_seq_length] for i in range(0, total_length, max_seq_length)]
+                    for k, t in concatenated_examples.items()
+                }
+                return result
+            
+            tokenized_datasets = tokenized_datasets.map(
+                group_texts,
+                batched=True,
+                num_proc=data_args.preprocessing_num_workers,
+                load_from_cache_file=not data_args.overwrite_cache,
+            )
+            irm_tokenized_datasets[env_name] = tokenized_datasets
 
     # Data collator pour MLM
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=data_args.mlm_probability)
@@ -353,28 +397,27 @@ def main():
         model=irm_model,
         args=training_args,
         eval_dataset=eval_tokenized_datasets if training_args.do_eval else None,
-        tokenizer=tokenizer, # à comparer
+        tokenizer=tokenizer,
         data_collator=data_collator,
     )
 
     if training_args.do_train:
-        if model_args.irm_games_mode == "full":
-            train_result = trainer.invariant_train_games(
-                training_set=train_tokenized_datasets,
-                nb_steps=nb_steps,
-                nb_steps_heads_saving=model_args.nb_steps_heads_saving,
-                nb_steps_model_saving=model_args.nb_steps_model_saving,
-                num_train_epochs=training_args.num_train_epochs,
-                update_phi_every_k=model_args.update_phi_every_k
-            )
-        else:  # mode simplifié
-            train_result = trainer.invariant_train(
-                training_set=train_tokenized_datasets,
-                nb_steps=nb_steps,
-                nb_steps_heads_saving=model_args.nb_steps_heads_saving,
-                nb_steps_model_saving=model_args.nb_steps_model_saving,
-                num_train_epochs=training_args.num_train_epochs,
-            )
+
+        if last_checkpoint is not None:
+            checkpoint = last_checkpoint
+        elif model_args.model_name_or_path is not None and os.path.isdir(model_args.model_name_or_path):
+            checkpoint = model_args.model_name_or_path
+        else:
+            checkpoint = None
+            warnings.warn("No checkpoint found. Training from scratch.")
+        
+        train_result = trainer.invariant_train(
+            training_set=train_tokenized_datasets,
+            nb_steps=nb_steps,
+            nb_steps_heads_saving=model_args.nb_steps_heads_saving,
+            nb_steps_model_saving=model_args.nb_steps_model_saving,
+            resume_from_checkpoint=checkpoint
+        )
 
         output_dir = training_args.output_dir
         trainer.model.save_pretrained(output_dir, safe_serialization=False) # sauvegarde le modèle
@@ -384,7 +427,7 @@ def main():
             wandb.finish()
         if trainer.is_world_process_zero() and training_args.do_eval:
             wandb.init(
-                project="invariant-language-models-5e-05",
+                project="ILM",
                 name=f"{training_args.run_name}-eval",
                 config=training_args.to_dict(),
                 reinit=True
@@ -415,14 +458,9 @@ def main():
         
         if trainer.is_world_process_zero():
             wandb.log({
-                "eval_in/loss": ind_loss,
-                "eval_in/perplexity": ind_perplexity,
-                "eval_ood/loss": ood_loss,
-                "eval_ood/perplexity": ood_perplexity
+                "evaluation/ind_perplexity": ind_perplexity,
+                "evaluation/ood_perplexity": ood_perplexity
             }, step=step)
-
-        trainer.model = None
-        del model
 
     if wandb.run:
         wandb.finish()
