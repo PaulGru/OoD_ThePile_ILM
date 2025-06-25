@@ -14,11 +14,10 @@ from tqdm import tqdm
 import wandb
 import math
 import os
-import csv
 import numpy as np
 from itertools import cycle
 import random
-
+from torch.amp import autocast, GradScaler
 from typing import Optional
 
 logger = logging.get_logger(__name__)
@@ -105,16 +104,16 @@ class InvariantTrainer(transformers.Trainer):
         else:
             max_steps = steps_per_epoch * num_train_epochs
 
-        dataloaders, optimizers, lr_schedulers = {}, {}, {}
+        dataloaders, head_optimizers, head_schedulers = {}, {}, {}
         for env_name, data_features in training_set.items():
             dataloaders[env_name] = self.get_single_train_dataloader(data_features["train"])
 
-            optimizers[env_name], lr_schedulers[env_name] = self.create_optimizer_and_scheduler(
+            head_optimizers[env_name], head_schedulers[env_name] = self.create_optimizer_and_scheduler(
                 self.model.lm_heads[env_name],
                 num_training_steps=max_steps
             )
 
-        optimizer, lr_scheduler = self.create_optimizer_and_scheduler(
+        phi_optimizer, phi_scheduler = self.create_optimizer_and_scheduler(
             self.model.encoder,
             num_training_steps=max_steps
         )
@@ -141,8 +140,8 @@ class InvariantTrainer(transformers.Trainer):
                         break
                     batch = next(iter_loaders[env_name])
                    
-                    optimizer.zero_grad()
-                    optimizers[env_name].zero_grad()
+                    phi_optimizer.zero_grad()
+                    head_optimizers[env_name].zero_grad()
                     self.model.train()
 
                     batch = {k: v.to(self.args.device) for k, v in batch.items() if torch.is_tensor(v)}
@@ -153,11 +152,11 @@ class InvariantTrainer(transformers.Trainer):
 
                     # Mise à jour des deux optimizers et mise à jour du scaler
                     optimizer.step()
-                    optimizers[env_name].step()
+                    head_optimizers[env_name].step()
 
                     # Mise à jour des schedulers
-                    lr_scheduler.step()
-                    lr_schedulers[env_name].step()
+                    phi_scheduler.step()
+                    head_schedulers[env_name].step()
 
                     self.state.global_step += 1
                     recent_losses.append(loss.item())
@@ -177,7 +176,157 @@ class InvariantTrainer(transformers.Trainer):
                     
                 
         print("=== Entraînement du modèle terminé. Nombre total de rounds:", self.state.global_step/len(training_set.keys()))
-        
+ 
+
+    def invariant_train_games(
+        self,
+        training_set,
+        nb_steps: Optional[int] = None,
+        nb_steps_heads_saving: Optional[int] = 0,
+        resume_from_checkpoint: Optional[str] = None,
+        num_train_epochs: Optional[int] = 1,
+        nb_steps_model_saving: Optional[int] = 0,
+        update_phi_every_k: Optional[int] = 1,
+        **kwargs,
+    ):
+
+        if "model_path" in kwargs:
+            resume_from_checkpoint = kwargs.pop("model_path")
+            warnings.warn(
+                "`model_path` is deprecated and will be removed in a future version. Use `resume_from_checkpoint` "
+                "instead.",
+                FutureWarning,
+            )
+
+        # Determine steps per epoch and max steps
+        min_train_size = min(len(data["train"]) for _, data in training_set.items())
+        steps_per_epoch = math.floor(
+            min_train_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size)
+        )
+        if nb_steps is not None:
+            num_train_epochs = max(1, math.floor(nb_steps / steps_per_epoch))
+            max_steps = nb_steps
+        else:
+            max_steps = steps_per_epoch * num_train_epochs
+
+        # Prepare dataloaders, optimizers, schedulers
+        dataloaders = {env: self.get_single_train_dataloader(data["train"]) for env, data in training_set.items()}
+        head_optimizers = {}
+        head_schedulers = {}
+        for env in training_set:
+            head_optimizers[env], head_schedulers[env] = self.create_optimizer_and_scheduler(
+                self.model.lm_heads[env], num_training_steps=max_steps
+            )
+        phi_optimizer, phi_scheduler = self.create_optimizer_and_scheduler(
+            self.model.encoder, num_training_steps=max_steps
+        )
+
+        # Move model to device
+        if self.args.n_gpu > 0:
+            self.model.to(self.args.device)
+        if self.args.n_gpu > 1:
+            self.model = torch.nn.DataParallel(self.model)
+
+        # Create freeze/unfreeze helpers
+        def freeze_heads_and_backbone(current):
+            for p in self.model.encoder.parameters():
+                p.requires_grad = False
+            for env, head in self.model.lm_heads.items():
+                for p in head.parameters():
+                    p.requires_grad = (env == current)
+        def unfreeze_all():
+            for p in self.model.encoder.parameters():
+                p.requires_grad = True
+            for head in self.model.lm_heads.values():
+                for p in head.parameters():
+                    p.requires_grad = True
+
+        self.state.global_step = 0
+        phi_counter = 0
+        phi_batches = []
+        saving_heads = bool(nb_steps_heads_saving > 0)
+        saving_intermediary_models = bool(nb_steps_model_saving > 0)
+
+        recent_head_losses = []
+        recent_phi_losses = []
+
+        self.scaler = GradScaler()
+        iter_loaders = {env: cycle(dl) for env, dl in dataloaders.items()}
+
+        # Training loop
+        for epoch in range(int(num_train_epochs)):
+            if self.is_world_process_zero():
+                print(f"===== EPOCH {epoch+1}/{num_train_epochs} =====")
+
+            for round_idx in tqdm(range(steps_per_epoch)):
+                for env in training_set:
+                    if self.state.global_step >= max_steps:
+                        break
+
+                    # Head update
+                    batch = next(iter_loaders[env])
+
+                    freeze_heads_and_backbone(env)
+                    head_optimizers[env].zero_grad()
+                    self.model.train()
+
+                    batch = {k: v.to(self.args.device) for k, v in batch.items() if torch.is_tensor(v)}
+                    with autocast(device_type="cuda"):
+                        loss_head = self.model(**batch).loss
+                    self.scaler.scale(loss_head).backward()
+                    self.scaler.step(head_optimizers[env])
+                    self.scaler.update()
+                    head_schedulers[env].step()
+
+                    # Track head loss
+                    self.state.global_step += 1
+                    recent_head_losses.append(loss_head.item())
+                    moving_avg_head = compute_moving_average(recent_head_losses, window_size=20)
+                    phi_counter += 1
+                    phi_batches.append({k: v.detach().cpu() for k, v in batch.items()})
+
+                    # Logging head loss
+                    if self.is_world_process_zero() and nb_steps_model_saving > 0 and self.state.global_step % nb_steps_model_saving == 0:
+                        wandb.log({
+                            "training/head_loss": loss_head.item(),
+                            "training/head_loss_moving_avg": moving_avg_head,
+                        }, step=self.state.global_step)
+
+                    # Save heads/models
+                    if nb_steps_heads_saving and self.state.global_step % nb_steps_heads_saving == 0:
+                        self.save_heads(self.state.global_step)
+                    if nb_steps_model_saving and self.state.global_step % nb_steps_model_saving == 0:
+                        self.save_intermediary_model(self.state.global_step)
+
+                    # Phi update every k head updates
+                    if phi_counter >= update_phi_every_k:
+                        unfreeze_all()
+                        phi_optimizer.zero_grad()
+                        total_phi_loss = 0.0
+                        
+                        for batch_phi in phi_batches:
+                            batch_phi = {k: v.to(self.args.device) for k, v in b.items()}
+                            with autocast(device_type="cuda"):
+                                total_phi_loss += self.model(**batch_phi).loss
+                        self.scaler.scale(total_phi_loss).backward()
+                        self.scaler.step(phi_optimizer)
+                        self.scaler.update()
+                        phi_scheduler.step()
+
+                        # Track phi loss
+                        recent_phi_losses.append(total_phi_loss.item())
+                        moving_avg_phi = compute_moving_average(recent_phi_losses, window_size=20)
+                        if self.is_world_process_zero() and nb_steps_model_saving > 0 and self.state.global_step % nb_steps_model_saving == 0:
+                            wandb.log({
+                                "training/phi_loss": total_phi_loss.item(),
+                                "training/phi_loss_moving_avg": moving_avg_phi,
+                            }, step=self.state.global_step)
+
+                        # Reset phi buffers
+                        phi_counter = 0
+                        phi_batches.clear()
+        if self.is_world_process_zero():
+            print("=== Training complete. Total rounds:", self.state.global_step / len(training_set))
 
 
     def save_intermediary_model(self, n_steps):

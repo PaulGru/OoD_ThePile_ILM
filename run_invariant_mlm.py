@@ -17,6 +17,7 @@ Fine-tuning the library models for masked language modeling (BERT, ALBERT, RoBER
 Here is the full list of checkpoints on the hub that can be fine-tuned by this script:
 https://huggingface.co/models?filter=masked-lm
 """
+import warnings
 import logging
 import math
 import os
@@ -37,10 +38,6 @@ from invariant_trainer import InvariantTrainer
 
 from invariant_roberta import InvariantRobertaForMaskedLM, InvariantRobertaConfig
 from invariant_distilbert import InvariantDistilBertForMaskedLM, InvariantDistilBertConfig
-from invariant_xlmroberta import InvariantXLMRobertaForMaskedLM, InvariantXLMRobertaConfig
-
-from transformers.models.xlm_roberta.tokenization_xlm_roberta_fast import XLMRobertaTokenizerFast
-from transformers.models.xlm_roberta.tokenization_xlm_roberta import XLMRobertaTokenizer
 
 import transformers
 from transformers import (
@@ -68,15 +65,12 @@ MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 CONFIG_MAPPING.update({'invariant-distilbert': InvariantDistilBertConfig})
 CONFIG_MAPPING.update({'invariant-roberta': InvariantRobertaConfig})
-CONFIG_MAPPING.update({'invariant-xlm-roberta': InvariantXLMRobertaConfig})
 
 MODEL_FOR_MASKED_LM_MAPPING.update({InvariantDistilBertConfig: InvariantDistilBertForMaskedLM})
 MODEL_FOR_MASKED_LM_MAPPING.update({InvariantRobertaConfig: InvariantRobertaForMaskedLM})
-MODEL_FOR_MASKED_LM_MAPPING.update({InvariantXLMRobertaConfig: InvariantXLMRobertaForMaskedLM})
 
 TOKENIZER_MAPPING.update({InvariantDistilBertConfig: (DistilBertTokenizer, DistilBertTokenizerFast)})
 TOKENIZER_MAPPING.update({InvariantRobertaConfig: (RobertaTokenizer, RobertaTokenizerFast)})
-TOKENIZER_MAPPING.update({InvariantXLMRobertaConfig: (XLMRobertaTokenizer, XLMRobertaTokenizerFast)})
 
 @dataclass
 class ModelArguments:
@@ -124,7 +118,7 @@ class ModelArguments:
         }
     )
     update_phi_every_k: Optional[int] = field(
-        default=5,
+        default=1,
         metadata={
             "help": "Nombre d'updates des têtes w^e avant une mise à jour du backbone phi dans l'entraînement IRM-Games."
         }
@@ -180,18 +174,6 @@ class DataTrainingArguments:
         if self.train_file is None and self.validation_file is None:
             raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
 
-# Fonction de regroupement des textes
-def create_group_texts(max_seq_length):
-    def group_texts(examples):
-        concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        total_length = (total_length // max_seq_length) * max_seq_length
-        result = {
-            k: [t[i: i + max_seq_length] for i in range(0, total_length, max_seq_length)]
-            for k, t in concatenated_examples.items()
-        }
-        return result
-    return group_texts
 
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
@@ -205,7 +187,7 @@ def main():
 
     if is_main_process(training_args.local_rank):
         wandb.init(
-            project="ILM",
+            project="Comparaison",
             name=training_args.run_name,
             config=training_args.to_dict()
         )
@@ -356,8 +338,16 @@ def main():
             irm_tokenized_datasets[env_name] = tokenized_datasets
 
         else:
+            # padding="max_length" if data_args.pad_to_max_length else True
+
             def tokenize_function(examples):
-                return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
+                return tokenizer(
+                    examples[text_column_name],
+                    # padding=padding,
+                    # truncation=True,
+                    # max_length=max_seq_length,
+                    return_special_tokens_mask=True
+                )
             
             tokenized_datasets = datasets.map(
                 tokenize_function,
@@ -404,19 +394,20 @@ def main():
     if training_args.do_train:
 
         if last_checkpoint is not None:
-            checkpoint = last_checkpoint
+            check_point = last_checkpoint
         elif model_args.model_name_or_path is not None and os.path.isdir(model_args.model_name_or_path):
-            checkpoint = model_args.model_name_or_path
+            check_point = model_args.model_name_or_path
         else:
-            checkpoint = None
+            check_point = None
             warnings.warn("No checkpoint found. Training from scratch.")
         
         train_result = trainer.invariant_train(
             training_set=train_tokenized_datasets,
             nb_steps=nb_steps,
+            update_phi_every_k=model_args.update_phi_every_k,
             nb_steps_heads_saving=model_args.nb_steps_heads_saving,
             nb_steps_model_saving=model_args.nb_steps_model_saving,
-            resume_from_checkpoint=checkpoint
+            resume_from_checkpoint=check_point
         )
 
         output_dir = training_args.output_dir
@@ -427,7 +418,7 @@ def main():
             wandb.finish()
         if trainer.is_world_process_zero() and training_args.do_eval:
             wandb.init(
-                project="ILM",
+                project="Comparaison",
                 name=f"{training_args.run_name}-eval",
                 config=training_args.to_dict(),
                 reinit=True
@@ -449,12 +440,14 @@ def main():
         ind_output = trainer.evaluate(eval_dataset=eval_tokenized_datasets)
         ind_loss = ind_output["eval_loss"]
         ind_perplexity = math.exp(ind_loss)
+        print(f"Évaluation In-Distribution - Perplexité: {ind_perplexity:.2f} (loss: {ind_loss:.2f})")
 
         # Évaluation OOD
         if eval_ood_tokenized_datasets is not None:
             ood_output = trainer.evaluate(eval_dataset=eval_ood_tokenized_datasets)
             ood_loss = ood_output["eval_loss"]
             ood_perplexity = math.exp(ood_loss)
+            print(f"Évaluation Out-Of-Distribution - Perplexité: {ood_perplexity:.2f} (loss: {ood_loss:.2f})")
         
         if trainer.is_world_process_zero():
             wandb.log({

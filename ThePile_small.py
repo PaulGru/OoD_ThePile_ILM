@@ -1,74 +1,60 @@
 import os
+import random
 from datasets import load_dataset, concatenate_datasets
 from transformers import DistilBertTokenizerFast
 
-# 1. Charger le dataset complet
-val_dataset = load_dataset("monology/pile-test-val", split="validation")
-test_dataset = load_dataset("monology/pile-test-val", split="test")
+MAX_PER_ENV = 1000
 
-# 2. Combiner les deux
-full_dataset = concatenate_datasets([val_dataset, test_dataset])
-print(f"Nombre total d'exemples : {len(full_dataset)}")  # pour vérification
+# 1. Charger le dataset complet
+dataset_val = load_dataset("monology/pile-test-val", split="validation")
+dataset_test = load_dataset("monology/pile-test-val", split="test")
+dataset = concatenate_datasets([dataset_val, dataset_test])
 
 # 2. Fonctions de prétraitement
 def extract_environment(example):
     return {"environment": example["meta"].get("pile_set_name", "unknown")}
 
-def count_tokens(example):
-    token_ids = tokenizer.encode(example["text"], add_special_tokens=False)
-    return {"token_count": len(token_ids)}
+dataset = dataset.map(extract_environment)
 
-def compute_raw_weight(example):
-    return {"raw_weight": len(example["text"].encode("utf-8"))}
-
-# Initialiser le tokenizer et appliquer les maps
-tokenizer = DistilBertTokenizerFast.from_pretrained("distilbert-base-uncased")
-full_dataset = full_dataset.map(extract_environment)
-full_dataset = full_dataset.map(count_tokens, batched=False)
-full_dataset = full_dataset.map(compute_raw_weight, batched=False)
-
+# "BookCorpus2", "OpenSubtitles", "PhilPapers", "NIH ExPorter",
 # 3. Listes d'environnements
-train_envs = [
-    "Wikipedia (en)",
-    "Pile-CC",
+train_envs = [    
     "EuroParl",
-    "ArXiv",
-    "BookCorpus2",
-    "Books3",
-    "HackerNews",
-    "NIH ExPorter",
-    "StackExchange",
-    "USPTO Backgrounds",
-    "OpenSubtitles",
-    "DM Mathematics",
     "FreeLaw",
+    "DM Mathematics",
     "YoutubeSubtitles",
-    "OpenWebText2",
+    "USPTO Backgrounds",
+    "ArXiv",
+    "Books3",
+    "Wikipedia (en)",
+    "StackExchange",
+    "HackerNews",
+    "Pile-CC",
+]
+
+ood_envs = [
     "Github",
+    "Ubuntu IRC",
+    "OpenWebText2",
     "Enron Emails",
     "PubMed Central",
     "PubMed Abstracts",
-    "Ubuntu IRC",
     "Gutenberg (PG-19)",
-    "PhilPapers",
-]
-ood_envs = [
-    
 ]
 
 # 4. Filtrer In-Domain et OoD
-ind_dataset = full_dataset.filter(lambda x: x["environment"] in train_envs)
-ood_dataset = full_dataset.filter(lambda x: x["environment"] in ood_envs)
+ind_dataset = dataset.filter(lambda x: x["environment"] in train_envs)
+ood_dataset = dataset.filter(lambda x: x["environment"] in ood_envs)
 
 # 5. Split In-Domain pour entraînement / validation
-ind_split = ind_dataset.train_test_split(test_size=0.1, seed=42)
+ind_split = ind_dataset.train_test_split(test_size=0.1, seed=0)
 ind_train = ind_split["train"]
 ind_val = ind_split["test"]
 
 # 6. Création des dossiers de sortie
-output_folder = "small_the_pile_env"
+output_folder = "small_the_pile"
 train_folder = os.path.join(output_folder, "train_env")
-val_folder = os.path.join(output_folder, "val_env")
+val_folder = os.path.join(output_folder, "val_test")
 os.makedirs(train_folder, exist_ok=True)
 os.makedirs(val_folder, exist_ok=True)
 
@@ -78,44 +64,52 @@ def write_dataset_to_file(dataset, filename):
             f.write(example.get("text", "").replace("\n", " ") + "\n")
 
 # 7. Sauvegarder l'ensemble des données d'entraînement (sans distinction d'environnements)
-all_train_file = os.path.join(train_folder, "all_train.txt")
+all_train_file = os.path.join(output_folder, "all_train.txt")
 write_dataset_to_file(ind_train, all_train_file)
-print(f"Combined train file created with {len(ind_train)} examples.")
 
-# 8. Sauvegarder les fichiers de validation
+MAX_PER_ENV = 1000
+
+# --- In-Domain (val_ind) équilibré "tronqué"
+ind_val_limited = []
+for env in train_envs:
+    subset = ind_val.filter(lambda x: x["environment"] == env)
+    n_samples = min(len(subset), MAX_PER_ENV)
+    if n_samples > 0:
+        sampled = subset.shuffle(seed=42).select(range(n_samples))
+        ind_val_limited.append(sampled)
+
+ind_val_trimmed = concatenate_datasets(ind_val_limited)
+print(f"val_ind tronqué : {len(ind_val_trimmed)} exemples (max {MAX_PER_ENV}/env)")
+
+# --- Out-of-Domain (val_ood) équilibré "tronqué"
+ood_val_limited = []
+for env in ood_envs:
+    subset = ood_dataset.filter(lambda x: x["environment"] == env)
+    n_samples = min(len(subset), MAX_PER_ENV)
+    if n_samples > 0:
+        sampled = subset.shuffle(seed=42).select(range(n_samples))
+        ood_val_limited.append(sampled)
+
+ood_val_trimmed = concatenate_datasets(ood_val_limited)
+print(f"val_ood tronqué : {len(ood_val_trimmed)} exemples (max {MAX_PER_ENV}/env)")
+
+# 9. Sauvegarder les fichiers de validation
 val_ind_file = os.path.join(val_folder, "val_ind.txt")
-write_dataset_to_file(ind_val, val_ind_file)
-print(f"InD validation file created with {len(ind_val)} examples.")
+write_dataset_to_file(ind_val_trimmed, val_ind_file)
 
 val_ood_file = os.path.join(val_folder, "val_ood.txt")
-write_dataset_to_file(ood_dataset, val_ood_file)
-print(f"OoD validation file created with {len(ood_dataset)} examples.")
+write_dataset_to_file(ood_val_trimmed, val_ood_file)
 
-print("\nEnvironnements effectivement présents dans le train set :")
-found_envs = set(ind_train.unique("environment"))
-print(found_envs)
-
-missing_envs = [env for env in train_envs if env not in found_envs]
-if missing_envs:
-    print(f"\n Les environnements suivants sont absents du train set (aucun exemple trouvé) : {missing_envs}")
-
-# 9. Sauvegarder les fichiers par environnement (train only)
+# 10. Sauvegarder les fichiers par environnement (train only)
 for env in train_envs:
     subset_train = ind_train.filter(lambda x: x["environment"] == env)
-    output_file = os.path.join(output_folder, f"{env}.txt")
+    output_file = os.path.join(train_folder, f"{env}.txt")
     write_dataset_to_file(subset_train, output_file)
     print(f"Train file for '{env}' created with {len(subset_train)} examples.")
 
-# 10. Afficher les tailles par environnement pour vérification
+# 11. Afficher les tailles par environnement pour vérification
 print("\nStatistiques par environnement (train set):")
 total_train = len(ind_train)
 for env in train_envs:
     count = len(ind_train.filter(lambda x: x["environment"] == env))
     print(f"- {env}: {count} exemples ({100 * count / total_train:.2f}% du total)")
-
-
-all_envs = set(full_dataset.unique("environment"))
-used_envs = set(train_envs + ood_envs)
-ignored_envs = all_envs - used_envs
-
-print(f"\n🌐 Environnements présents dans le dataset mais ignorés (ni InD ni OoD) : {ignored_envs}")
