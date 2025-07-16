@@ -136,7 +136,6 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
                 FutureWarning,
             )
             labels = kwargs.pop("masked_lm_labels")
-        
         assert kwargs == {}, f"Unexpected keyword arguments: {list(kwargs.keys())}."
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -150,9 +149,7 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-
         sequence_output = outputs[0]
-
         if self.n_environments == 1:
             lm_head = list(self.lm_heads.values())[0]
             prediction_scores = lm_head(sequence_output)

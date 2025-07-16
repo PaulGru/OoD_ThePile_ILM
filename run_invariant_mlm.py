@@ -25,7 +25,6 @@ import sys
 import torch
 import wandb
 import glob
-import gc
 import torch.distributed as dist
 from dataclasses import dataclass, field
 from typing import Optional
@@ -95,6 +94,22 @@ class ModelArguments:
         default=True,
         metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
     )
+    model_revision: str = field(
+        default="main",
+        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
+    )
+    use_auth_token: bool = field(
+        default=False,
+        metadata={
+            "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
+            "with private models)."
+        },
+    )
+    mode: Optional[str] = field(
+        default="ilm",
+        metadata={
+            "help": "Whether to train the heads as an ensemble instead of following the IRM-games dynamics"}
+    )
     nb_steps_heads_saving: Optional[int] = field(
         default=0,
         metadata={"help": "Number of training steps between saving the head weights (if 0, the heads are not saved regularly)."},
@@ -103,26 +118,7 @@ class ModelArguments:
         default=0,
         metadata={"help": "Number of training steps between saving the full model (if 0, the heads are not saved regularly)."},
     )
-    dropout: float = field(
-        default=0.1,
-        metadata={"help": "Taux de dropout pour le modèle."}
-    )
-    attention_dropout: float = field(
-        default=0.1,
-        metadata={"help": "Taux de dropout pour l'attention."}
-    )
-    irm_games_mode: Optional[str] = field(
-        default="simplified",
-        metadata={
-            "help": "Choix entre 'simplified' pour update phi à chaque batch (ILM) ou 'full' pour IRM-Games complet."
-        }
-    )
-    update_phi_every_k: Optional[int] = field(
-        default=1,
-        metadata={
-            "help": "Nombre d'updates des têtes w^e avant une mise à jour du backbone phi dans l'entraînement IRM-Games."
-        }
-    )
+
 
 @dataclass
 class DataTrainingArguments:
@@ -136,6 +132,10 @@ class DataTrainingArguments:
     validation_file: Optional[str] = field(
         default=None,
         metadata={"help": "The input validation data file or directory (a text file or directory)."},
+    )
+    ood_validation_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "Fichier de validation Out-Of-Distribution (.txt) jamais vu à l'entraînement"}
     )
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
@@ -165,14 +165,21 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "Number of training steps."}
     )
-    ood_validation_file: Optional[str] = field(
-        default=None,
-        metadata={"help": "Fichier de validation Out-Of-Distribution (.txt) jamais vu à l'entraînement"}
-    )
 
     def __post_init__(self):
         if self.train_file is None and self.validation_file is None:
             raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
+
+
+@dataclass
+class CustomTrainingArguments(TrainingArguments):
+    """
+    On surcharge la classe par défaut pour permettre la boucle d'entraînement IRM Games.
+    """
+    head_updates_per_encoder_update : Optional[int] = field(
+        default=1,
+        metadata={"help": "Number of head updates per encoder update (IRM Games)"}
+    )
 
 
 def main():
@@ -214,14 +221,19 @@ def main():
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
-        level=logging.WARNING
     )
-    logger.setLevel(logging.ERROR)
+    logger.setLevel(logging.INFO if is_main_process(training_args.local_rank) else logging.WARN)
+
+    logger.info(
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
+        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+    )
 
     if is_main_process(training_args.local_rank):
         transformers.utils.logging.set_verbosity_warning()
         transformers.utils.logging.enable_default_handler()
         transformers.utils.logging.enable_explicit_format()
+    logger.info("Training/evaluation parameters %s", training_args)
 
     set_seed(training_args.seed)
 
@@ -229,21 +241,12 @@ def main():
     datasets = {}
     # Chargement des datasets d'entraînement
     if training_args.do_train:
-        if train_folder is not None:
-            if os.path.isdir(train_folder): # on vérifie si le chemin mène à un répertoire
-                # iLM prend plusieurs environnements, on charge les fichiers d'entraînement par environnement
-                print("Contenu de train_env :", os.listdir(train_folder)) # liste les éléments du dossier
-                
-                for file in os.listdir(train_folder):
-                    if file.endswith('.txt'):
-                        env_name = file.split(".")[0]
-                        data_files = {"train": os.path.join(train_folder, file)}
-                        datasets[env_name] = load_dataset("text", data_files=data_files)
-                     
-            else: # si c'est un fichier unique, c'est pour eLM
-                data_files = {"train": data_args.train_file}
-                dataset = load_dataset("text", data_files=data_files)
-                datasets = {"all_train": dataset}
+        if train_folder is not None:  
+            for file in os.listdir(train_folder):
+                if file.endswith('.txt'):
+                    env_name = file.split(".")[0]
+                    data_files = {"train": os.path.join(train_folder, file)}
+                    datasets[env_name] = load_dataset("text", data_files=data_files)
         else:
             raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
 
@@ -251,7 +254,7 @@ def main():
     if training_args.do_eval:
         if data_args.validation_file is not None:
             data_files = {"validation": data_args.validation_file}
-            datasets["validation-file"] = load_dataset("text", data_files=data_files)
+            datasets["ind-validation"] = load_dataset("text", data_files=data_files)
         else:
             raise ValueError("Aucun fichier de validation n'est spécifié pour l'évaluation.")
     
@@ -263,31 +266,68 @@ def main():
             raise ValueError("Aucun fichier de validation hors distribution n'est spécifié pour l'évaluation.")
    
     # Configuration du modèle et du tokenizer
+
+    # if training_args.do_eval:
+    #     InvariantDistilBertForMaskedLM.config_class   = InvariantDistilBertConfig
+    #     InvariantDistilBertForMaskedLM.base_model_prefix = "distilbert"
+
+    #     # 1) Puis on enregistre
+    #     try:
+    #         AutoConfig.register("invariant-distilbert", InvariantDistilBertConfig)
+    #         AutoModelForMaskedLM.register(InvariantDistilBertConfig, InvariantDistilBertForMaskedLM)
+    #         AutoTokenizer.register(InvariantDistilBertConfig, DistilBertTokenizer)
+    #         AutoTokenizer.register(InvariantDistilBertConfig, DistilBertTokenizerFast)
+    #     except Exception:
+    #         pass
+
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
+        "revision": model_args.model_revision,
+        "use_auth_token": True if model_args.use_auth_token else None,
     }
-    config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
     
+    if model_args.model_name_or_path:
+        config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
+    else:
+        config = CONFIG_MAPPING[model_args.model_type]()
+        logger.warning("You are instantiating a new config instance from scratch.")
+
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir, # répertoire où HuggingFace stock les fichiers téléchargés (tokenizer, vocab, etc.).
         "use_fast": model_args.use_fast_tokenizer,
+        "revision": model_args.model_revision,
+        "use_auth_token": True if model_args.use_auth_token else None,
     }
-    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
-    
-    model = AutoModelForMaskedLM.from_pretrained(
-        model_args.model_name_or_path,
-        config=config,
-        cache_dir=model_args.cache_dir,
-    )
+    if model_args.model_name_or_path:
+        tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
+    else:
+        raise ValueError(
+            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
+            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
+        )
+
+    if model_args.model_name_or_path:
+        model = AutoModelForMaskedLM.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+    else:
+        logger.info("Training new model from scratch")
+        model = AutoModelForMaskedLM.from_config(config)
  
     envs = [k for k in datasets.keys() if 'validation' not in k]
     
     if 'envs' not in config.to_dict():
-        if model_args.model_name_or_path:
+        if 'distil' in model_args.model_name_or_path:
             inv_config = InvariantDistilBertConfig(envs=envs, **config.to_dict())
             irm_model = InvariantDistilBertForMaskedLM(inv_config, model)
         else:
-            raise ValueError("Modèle inconnu")
+            inv_config = InvariantRobertaConfig(envs=envs, **config.to_dict())
+            irm_model = InvariantRobertaForMaskedLM(inv_config, model)
     else:
         irm_model = model
     
@@ -338,16 +378,8 @@ def main():
             irm_tokenized_datasets[env_name] = tokenized_datasets
 
         else:
-            # padding="max_length" if data_args.pad_to_max_length else True
-
             def tokenize_function(examples):
-                return tokenizer(
-                    examples[text_column_name],
-                    # padding=padding,
-                    # truncation=True,
-                    # max_length=max_seq_length,
-                    return_special_tokens_mask=True
-                )
+                return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
             
             tokenized_datasets = datasets.map(
                 tokenize_function,
@@ -378,21 +410,22 @@ def main():
     # Data collator pour MLM
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=data_args.mlm_probability)
     
-    train_tokenized_datasets = {k: v for k, v in irm_tokenized_datasets.items() if 'validation-file' not in k and 'ood-validation' not in k}
-    eval_tokenized_datasets = irm_tokenized_datasets['validation-file']['validation']
+    train_tokenized_datasets = {k: v for k, v in irm_tokenized_datasets.items() if 'ind-validation' not in k and 'ood-validation' not in k}
+    eval_ind_tokenized_datasets = irm_tokenized_datasets['ind-validation']['validation']
     eval_ood_tokenized_datasets = irm_tokenized_datasets["ood-validation"]["validation"]
+
+    print("fp16 demandé :", training_args.fp16, "backend :", training_args.fp16_backend)
 
     # Initialisation du Trainer
     trainer = InvariantTrainer(
         model=irm_model,
         args=training_args,
-        eval_dataset=eval_tokenized_datasets if training_args.do_eval else None,
+        eval_dataset=eval_ind_tokenized_datasets if training_args.do_eval else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
     )
 
     if training_args.do_train:
-
         if last_checkpoint is not None:
             check_point = last_checkpoint
         elif model_args.model_name_or_path is not None and os.path.isdir(model_args.model_name_or_path):
@@ -401,14 +434,23 @@ def main():
             check_point = None
             warnings.warn("No checkpoint found. Training from scratch.")
         
-        train_result = trainer.invariant_train(
-            training_set=train_tokenized_datasets,
-            nb_steps=nb_steps,
-            update_phi_every_k=model_args.update_phi_every_k,
-            nb_steps_heads_saving=model_args.nb_steps_heads_saving,
-            nb_steps_model_saving=model_args.nb_steps_model_saving,
-            resume_from_checkpoint=check_point
-        )
+        if model_args.mode == "ilm":
+            train_result = trainer.invariant_train(
+                training_set=train_tokenized_datasets,
+                nb_steps=nb_steps,
+                nb_steps_heads_saving=model_args.nb_steps_heads_saving,
+                nb_steps_model_saving=model_args.nb_steps_model_saving,
+                resume_from_checkpoint=check_point
+            )
+
+        elif model_args.mode == "game":
+            train_result = trainer.invariant_train_games(
+                training_set=train_tokenized_datasets,
+                nb_steps=nb_steps,
+                nb_steps_heads_saving=model_args.nb_steps_heads_saving,
+                nb_steps_model_saving=model_args.nb_steps_model_saving,
+                resume_from_checkpoint=check_point
+            )
 
         output_dir = training_args.output_dir
         trainer.model.save_pretrained(output_dir, safe_serialization=False) # sauvegarde le modèle
@@ -424,6 +466,24 @@ def main():
                 reinit=True
             )
 
+    # results = {}
+    # if training_args.do_eval:
+    #     logger.info("*** Evaluate ***")
+    #     eval_output = trainer.evaluate()
+    #     eval_loss = eval_output["eval_loss"]
+    #     results["eval_loss"] = eval_loss
+    #     results["perplexity"] = math.exp(eval_loss)
+
+    #     if trainer.is_world_process_zero():
+    #         # Log dans un fichier txt (optionnel)
+    #         output_txt = os.path.join(training_args.output_dir, "eval_results_mlm.txt")
+    #         with open(output_txt, "w") as f:
+    #             for key, value in sorted(results.items()):
+    #                 logger.info(f"  {key} = {value}")
+    #                 f.write(f"{key} = {value}\n")
+
+    # return results
+
     checkpoints = sorted(glob.glob(os.path.join(training_args.output_dir, "model-*")))
     iterator = tqdm(checkpoints, desc="Évaluation des checkpoints") if trainer.is_world_process_zero() else checkpoints
 
@@ -437,7 +497,7 @@ def main():
             print("modèle chargé depuis le checkpoint :", checkpoint_path)
 
         # Évaluation In-Distribution
-        ind_output = trainer.evaluate(eval_dataset=eval_tokenized_datasets)
+        ind_output = trainer.evaluate(eval_dataset=eval_ind_tokenized_datasets)
         ind_loss = ind_output["eval_loss"]
         ind_perplexity = math.exp(ind_loss)
         print(f"Évaluation In-Distribution - Perplexité: {ind_perplexity:.2f} (loss: {ind_loss:.2f})")

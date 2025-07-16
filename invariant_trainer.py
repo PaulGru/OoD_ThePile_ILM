@@ -94,75 +94,138 @@ class InvariantTrainer(transformers.Trainer):
 
         min_train_set_size = min([len(data["train"]) for _, data in training_set.items()])
         
-        # Calcul du nombre d'updates (steps) effectués durant une epoch pour chaque environnement
-        steps_per_epoch = math.floor(
-            min_train_set_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size)
-        )
         if nb_steps is not None:
-            num_train_epochs = max(1, math.floor(nb_steps / steps_per_epoch))
             max_steps = nb_steps
+            steps_per_epoch = math.floor(
+                min_train_set_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size)
+            )
+            num_train_epochs = max(1, math.floor(max_steps / steps_per_epoch))
         else:
+            steps_per_epoch = math.floor(
+                min_train_set_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size)
+            )
             max_steps = steps_per_epoch * num_train_epochs
 
         dataloaders, head_optimizers, head_schedulers = {}, {}, {}
         for env_name, data_features in training_set.items():
             dataloaders[env_name] = self.get_single_train_dataloader(data_features["train"])
-
-            head_optimizers[env_name], head_schedulers[env_name] = self.create_optimizer_and_scheduler(
+            optimizer, head_scheduler = self.create_optimizer_and_scheduler(
                 self.model.lm_heads[env_name],
                 num_training_steps=max_steps
             )
+            head_optimizers[env_name] = optimizer
+            head_schedulers[env_name] = head_scheduler
 
         phi_optimizer, phi_scheduler = self.create_optimizer_and_scheduler(
             self.model.encoder,
             num_training_steps=max_steps
         )
 
+        self.state = TrainerState()
+
         if self.args.n_gpu > 0:
             self.model.to(self.args.device)
         if self.args.n_gpu > 1:
             self.model = torch.nn.DataParallel(self.model)
+        
+        total_train_batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
+        num_examples = total_train_batch_size * max_steps
+
+        logger.info("***** Running training *****")
+        logger.info(f"  Num examples = {num_examples}")
+        logger.info(f"  Num Epochs = {num_train_epochs}")
+        logger.info(f"  steps_per_epoch = {steps_per_epoch}")
+        logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size}")
+        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
+        logger.info(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
+        logger.info(f"  Total optimization steps = {max_steps}")
 
         saving_heads = bool(nb_steps_heads_saving > 0)
         saving_intermediary_models = bool(nb_steps_model_saving > 0)
         self.state.global_step = 0
+        
         recent_losses = []
 
-        iter_loaders = {env_name: cycle(dataloaders[env_name]) for env_name in training_set.keys()}
+        self.scaler = GradScaler()
+        
+        self.use_amp = bool(self.args.fp16 and torch.cuda.is_available())
+        print(f"use_amp = {self.use_amp}")
 
+        iter_loaders = {env_name: cycle(dataloaders[env_name]) for env_name in training_set.keys()}
         for epoch in range(int(num_train_epochs)):
-            print(f"\n===== ÉPOQUE {epoch + 1}/{num_train_epochs} =====")
-            
-            # Un round correspond à une itération sur tous les environnements
+            logger.info(f" Epoch: {epoch}")
+
+            # iter_loaders = {}
+            # for env_name in training_set.keys():
+            #     iter_loaders[env_name] = iter(dataloaders[env_name])
+
             for round_idx in tqdm(range(steps_per_epoch)):
-                for env_name in random.sample(list(training_set.keys()), k=len(training_set)):
-                    if self.state.global_step >= max_steps :
-                        break
-                    batch = next(iter_loaders[env_name])
-                   
+                if self.state.global_step >= max_steps :
+                    break
+
+                for env_name in training_set.keys():
+                    logger.info(f" Update on environement {env_name}")
+
                     phi_optimizer.zero_grad()
                     head_optimizers[env_name].zero_grad()
+
+                    batch = next(iter_loaders[env_name])     
+                    
                     self.model.train()
+                    batch = self._prepare_inputs(batch)
 
-                    batch = {k: v.to(self.args.device) for k, v in batch.items() if torch.is_tensor(v)}
-                    outputs = self.model(**batch)
-                    loss = outputs.loss
+                    if self.use_amp:
+                        with autocast("cuda", enabled=self.use_amp):
+                            loss = self.compute_loss(self.model, batch)
+                    else:
+                        loss = self.compute_loss(self.model, batch)
 
-                    loss.backward()
+                    if self.args.n_gpu > 1:
+                        loss = loss.mean()
+                    
+                    if self.args.gradient_accumulation_steps > 1:
+                        loss = loss / self.args.gradient_accumulation_steps
+                    
+                    if self.use_amp:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
 
-                    # Mise à jour des deux optimizers et mise à jour du scaler
-                    optimizer.step()
-                    head_optimizers[env_name].step()
+                    loss = loss.detach()
+                    
+                    if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
+                        if self.use_amp:
+                            self.scaler.unscale_(phi_optimizer)
+                            self.scaler.unscale_(head_optimizers[env_name])
+
+                        if hasattr(phi_optimizer, "clip_grad_norm"):
+                            # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
+                            phi_optimizer.clip_grad_norm(self.args.max_grad_norm)
+                            head_optimizers[env_name].clip_grad_norm(self.args.max_grad_norm)
+                        else:
+                            # Revert to normal clipping otherwise, handling Apex or full precision
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(),
+                                self.args.max_grad_norm,
+                            )
+
+                    if self.use_amp:
+                        self.scaler.step(phi_optimizer)
+                        self.scaler.step(head_optimizers[env_name])
+                        self.scaler.update()
+                    else:
+                        phi_optimizer.step()
+                        head_optimizers[env_name].step()
 
                     # Mise à jour des schedulers
                     phi_scheduler.step()
                     head_schedulers[env_name].step()
 
                     self.state.global_step += 1
+                    
                     recent_losses.append(loss.item())
                     moving_avg_loss = compute_moving_average(recent_losses, window_size=20)
-
-                    if self.is_world_process_zero() and self.state.global_step % nb_steps_model_saving == 0:
+                    if self.is_world_process_zero() and (nb_steps_model_saving > 0) and self.state.global_step % nb_steps_model_saving == 0:
                         wandb.log({
                             "training/train_loss": loss.item(),
                             "training/train_loss_moving_avg": moving_avg_loss
@@ -186,9 +249,10 @@ class InvariantTrainer(transformers.Trainer):
         resume_from_checkpoint: Optional[str] = None,
         num_train_epochs: Optional[int] = 1,
         nb_steps_model_saving: Optional[int] = 0,
-        update_phi_every_k: Optional[int] = 1,
         **kwargs,
     ):
+
+        head_updates_per_encoder_update = getattr(self.args, "head_updates_per_encoder_update", 5)
 
         if "model_path" in kwargs:
             resume_from_checkpoint = kwargs.pop("model_path")
@@ -198,8 +262,8 @@ class InvariantTrainer(transformers.Trainer):
                 FutureWarning,
             )
 
-        # Determine steps per epoch and max steps
         min_train_size = min(len(data["train"]) for _, data in training_set.items())
+        
         steps_per_epoch = math.floor(
             min_train_size / (self.args.gradient_accumulation_steps * self.args.train_batch_size)
         )
@@ -209,122 +273,185 @@ class InvariantTrainer(transformers.Trainer):
         else:
             max_steps = steps_per_epoch * num_train_epochs
 
-        # Prepare dataloaders, optimizers, schedulers
-        dataloaders = {env: self.get_single_train_dataloader(data["train"]) for env, data in training_set.items()}
-        head_optimizers = {}
-        head_schedulers = {}
-        for env in training_set:
-            head_optimizers[env], head_schedulers[env] = self.create_optimizer_and_scheduler(
-                self.model.lm_heads[env], num_training_steps=max_steps
+        dataloaders, head_optimizers, head_schedulers = {}, {}, {}
+        for env_name, data_features in training_set.items():
+            dataloaders[env_name] = self.get_single_train_dataloader(data_features["train"])
+            head_optimizers[env_name], head_schedulers[env_name] = self.create_optimizer_and_scheduler(
+                self.model.lm_heads[env_name],
+                num_training_steps=max_steps
             )
+        
         phi_optimizer, phi_scheduler = self.create_optimizer_and_scheduler(
-            self.model.encoder, num_training_steps=max_steps
+            self.model.encoder,
+            num_training_steps=max_steps
         )
+
+        self.state = TrainerState()
 
         # Move model to device
         if self.args.n_gpu > 0:
             self.model.to(self.args.device)
         if self.args.n_gpu > 1:
             self.model = torch.nn.DataParallel(self.model)
+        
+        total_train_batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
+        num_examples = total_train_batch_size * max_steps
 
-        # Create freeze/unfreeze helpers
-        def freeze_heads_and_backbone(current):
-            for p in self.model.encoder.parameters():
-                p.requires_grad = False
-            for env, head in self.model.lm_heads.items():
-                for p in head.parameters():
-                    p.requires_grad = (env == current)
-        def unfreeze_all():
-            for p in self.model.encoder.parameters():
-                p.requires_grad = True
-            for head in self.model.lm_heads.values():
-                for p in head.parameters():
-                    p.requires_grad = True
+        logger.info("***** Running training *****")
+        logger.info(f"  Num examples = {num_examples}")
+        logger.info(f"  Num Epochs = {num_train_epochs}")
+        logger.info(f"  steps_per_epoch = {steps_per_epoch}")
+        logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size}")
+        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
+        logger.info(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
+        logger.info(f"  Total optimization steps = {max_steps}")
 
-        self.state.global_step = 0
-        phi_counter = 0
-        phi_batches = []
         saving_heads = bool(nb_steps_heads_saving > 0)
         saving_intermediary_models = bool(nb_steps_model_saving > 0)
+        self.state.global_step = 0
 
         recent_head_losses = []
         recent_phi_losses = []
 
         self.scaler = GradScaler()
-        iter_loaders = {env: cycle(dl) for env, dl in dataloaders.items()}
-
-        # Training loop
+        
+        iter_loaders = {env_name: cycle(dataloaders[env_name]) for env_name in training_set.keys()}
         for epoch in range(int(num_train_epochs)):
-            if self.is_world_process_zero():
-                print(f"===== EPOCH {epoch+1}/{num_train_epochs} =====")
+            logger.info(f" Epoch: {epoch}")
 
             for round_idx in tqdm(range(steps_per_epoch)):
-                for env in training_set:
-                    if self.state.global_step >= max_steps:
-                        break
+                if self.state.global_step >= max_steps:
+                    break
+                
+                for _ in range(head_updates_per_encoder_update):
+                    self.model.encoder.requires_grad_(False)
+                    for env_name in training_set.keys():
+                        logger.info(f" Update on environement {env_name}")
+                        self.model.lm_heads[env_name].requires_grad_(True)
+                        head_optimizers[env_name].zero_grad()
 
-                    # Head update
-                    batch = next(iter_loaders[env])
-
-                    freeze_heads_and_backbone(env)
-                    head_optimizers[env].zero_grad()
-                    self.model.train()
-
-                    batch = {k: v.to(self.args.device) for k, v in batch.items() if torch.is_tensor(v)}
-                    with autocast(device_type="cuda"):
-                        loss_head = self.model(**batch).loss
-                    self.scaler.scale(loss_head).backward()
-                    self.scaler.step(head_optimizers[env])
-                    self.scaler.update()
-                    head_schedulers[env].step()
-
-                    # Track head loss
-                    self.state.global_step += 1
-                    recent_head_losses.append(loss_head.item())
-                    moving_avg_head = compute_moving_average(recent_head_losses, window_size=20)
-                    phi_counter += 1
-                    phi_batches.append({k: v.detach().cpu() for k, v in batch.items()})
-
-                    # Logging head loss
-                    if self.is_world_process_zero() and nb_steps_model_saving > 0 and self.state.global_step % nb_steps_model_saving == 0:
-                        wandb.log({
-                            "training/head_loss": loss_head.item(),
-                            "training/head_loss_moving_avg": moving_avg_head,
-                        }, step=self.state.global_step)
-
-                    # Save heads/models
-                    if nb_steps_heads_saving and self.state.global_step % nb_steps_heads_saving == 0:
-                        self.save_heads(self.state.global_step)
-                    if nb_steps_model_saving and self.state.global_step % nb_steps_model_saving == 0:
-                        self.save_intermediary_model(self.state.global_step)
-
-                    # Phi update every k head updates
-                    if phi_counter >= update_phi_every_k:
-                        unfreeze_all()
-                        phi_optimizer.zero_grad()
-                        total_phi_loss = 0.0
+                        batch = next(iter_loaders[env_name])
                         
-                        for batch_phi in phi_batches:
-                            batch_phi = {k: v.to(self.args.device) for k, v in b.items()}
-                            with autocast(device_type="cuda"):
-                                total_phi_loss += self.model(**batch_phi).loss
-                        self.scaler.scale(total_phi_loss).backward()
-                        self.scaler.step(phi_optimizer)
-                        self.scaler.update()
-                        phi_scheduler.step()
+                        self.model.train()
+                        batch = self._prepare_inputs(batch)
 
-                        # Track phi loss
-                        recent_phi_losses.append(total_phi_loss.item())
-                        moving_avg_phi = compute_moving_average(recent_phi_losses, window_size=20)
+                        if self.use_apex:
+                            with autocast():
+                                loss_head = self.compute_loss(self.model, batch)
+                        else:
+                            loss_head = self.compute_loss(self.model, batch)
+
+                        if self.args.n_gpu > 1:
+                            loss_head = loss_head.mean()
+                    
+                        if self.args.gradient_accumulation_steps > 1:
+                            loss_head = loss_head / self.args.gradient_accumulation_steps
+                        
+                        if self.use_apex:
+                            self.scaler.scale(loss_head).backward()
+                        else:
+                            loss_head.backward()
+
+                        loss_head = loss_head.detach()
+                        recent_head_losses.append(loss_head.item())
+
+                        if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
+                            if self.use_apex:
+                                self.scaler.unscale_(head_optimizers[env_name])
+                            
+                            if hasattr(head_optimizers[env_name], "clip_grad_norm"):
+                                head_optimizers[env_name].clip_grad_norm(self.args.max_grad_norm)
+                            else:
+                                torch.nn.utils.clip_grad_norm_(
+                                    self.model.lm_heads[env_name].parameters(),
+                                    self.args.max_grad_norm,
+                                )
+                        
+                        if self.use_apex:
+                            self.scaler.step(head_optimizers[env_name])
+                        else:
+                            head_optimizers[env_name].step()
+
+                        head_schedulers[env_name].step()
+
+                        self.state.global_step += 1
+
+                        moving_avg_head = compute_moving_average(recent_head_losses, window_size=20)
                         if self.is_world_process_zero() and nb_steps_model_saving > 0 and self.state.global_step % nb_steps_model_saving == 0:
                             wandb.log({
-                                "training/phi_loss": total_phi_loss.item(),
-                                "training/phi_loss_moving_avg": moving_avg_phi,
+                                "training/head_loss": loss_head.item(),
+                                "training/head_loss_moving_avg": moving_avg_head,
                             }, step=self.state.global_step)
 
-                        # Reset phi buffers
-                        phi_counter = 0
-                        phi_batches.clear()
+                        if nb_steps_heads_saving and self.state.global_step % nb_steps_heads_saving == 0:
+                            self.save_heads(self.state.global_step)
+                        if nb_steps_model_saving and self.state.global_step % nb_steps_model_saving == 0:
+                            self.save_intermediary_model(self.state.global_step)
+
+
+                # === Phase 2: update shared encoder ===
+                self.model.encoder.requires_grad_(True)
+                for env_name in training_set.keys():
+                    self.model.lm_heads[env_name].requires_grad_(False)
+
+                phi_optimizer.zero_grad()
+                total_phi_loss = 0.0
+
+                for env_name in training_set.keys():
+                    batch = next(iter_loaders[env_name])
+                    
+                    self.model.train()
+                    batch = self._prepare_inputs(batch)
+
+                    if self.use_apex:
+                        with autocast():
+                            phi_loss = self.compute_loss(self.model, batch)
+                    else:
+                        phi_loss = self.compute_loss(self.model, batch)
+
+                    if self.args.n_gpu > 1:
+                        phi_loss = phi_loss.mean()
+                
+                    if self.args.gradient_accumulation_steps > 1:
+                        phi_loss = phi_loss / self.args.gradient_accumulation_steps
+                    
+                    if self.use_apex:
+                        self.scaler.scale(phi_loss).backward()
+                    else:
+                        phi_loss.backward()
+
+                    phi_loss = phi_loss.detach()
+                    total_phi_loss += phi_loss.item()
+
+                    if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
+                        if self.use_apex:
+                            self.scaler.unscale_(phi_optimizer)
+                        
+                        if hasattr(phi_optimizer, "clip_grad_norm"):
+                            phi_optimizer.clip_grad_norm(self.args.max_grad_norm)
+                        else:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.encoder.parameters(),
+                                self.args.max_grad_norm,
+                            )
+                    
+                    if self.use_apex:
+                        self.scaler.step(phi_optimizer)
+                        self.scaler.update()
+                    else:
+                        phi_optimizer.step()
+
+                    phi_scheduler.step()
+
+                    recent_phi_losses.append(total_phi_loss)
+                    moving_avg_phi = compute_moving_average(recent_phi_losses, window_size=20)
+                    if self.is_world_process_zero() and nb_steps_model_saving > 0 and self.state.global_step % nb_steps_model_saving == 0:
+                        wandb.log({
+                            "training/phi_loss": total_phi_loss,
+                            "training/phi_loss_moving_avg": moving_avg_phi,
+                        }, step=self.state.global_step)
+
+                        
         if self.is_world_process_zero():
             print("=== Training complete. Total rounds:", self.state.global_step / len(training_set))
 
@@ -372,5 +499,5 @@ class InvariantTrainer(transformers.Trainer):
             train_dataset,
             batch_size=self.args.train_batch_size,
             sampler=train_sampler,
-            collate_fn=self.data_collator,
+            collate_fn=self.data_collator
         )

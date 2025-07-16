@@ -1,65 +1,52 @@
 import os
-import csv
+import json
+import math
 import subprocess
+import shutil
+import pandas as pd
 
-env = os.environ.copy()
-env["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-runs_dir = "runs_elm"
-eval_file = "data/val_test/val_ood.txt"
-results_file = "eval_elm_ood.csv"
+base_dir = "runs_ilmg" # ilm
+# 1) On déclare nos deux jeux de test
+test_sets = {
+    "in_dist":  "data/val_test/val_ind.txt",
+    "out_dist": "data/val_test/val_ood.txt"
+}
 
-# Liste des répertoires à traiter
-run_dirs = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d))]
+# 2) On prépare un dictionnaire pour collecter les résultats
+all_records = { mode: [] for mode in test_sets }
 
-# Liste pour stocker les résultats
-results = []
+# 3) On boucle d'abord sur chaque mode (in/out)
+for mode, test_file in test_sets.items():
+    print(f"\n Lancement des évaluations [{mode}] avec `{test_file}`\n")
+    for seed_dir in sorted(os.listdir(base_dir)):
+        seed_path = os.path.join(base_dir, seed_dir)
+        if not os.path.isdir(seed_path):
+            continue
 
-for run in run_dirs:
-    run_path = os.path.join(runs_dir, run)
-    best_model_path = os.path.join(run_path, "best_model")
+        for model_folder in sorted(os.listdir(seed_path)):
+            if not model_folder.startswith("model-"):
+                continue
 
-    if not os.path.isdir(best_model_path):
-        print(f"Pas de best_model dans {run}")
-        continue
+            model_path = os.path.join(seed_path, model_folder)
+            print(f"[{mode}] Seed `{seed_dir}` - Modèle `{model_folder}`")
 
-    print(f"Évaluation de {run}")
+            eval_out = os.path.join(model_path, f"eval_{mode}")
+            os.makedirs(eval_out, exist_ok=True)
 
-    # Appel au script d'éval avec les bons paramètres
-    cmd = [
-        "python3", "run_invariant_mlm.py",
-        "--model_name_or_path", best_model_path,
-        "--tokenizer_name", "distilbert-base-uncased",
-        "--validation_file", eval_file,
-        "--output_dir", os.path.join(run_path, "ood_eval"),
-        "--do_eval",
-        "--eval_type", "ood"
-    ]
-
-    completed = subprocess.run(cmd, capture_output=True, text=True, env=env)
-
-    # Extraction des résultats de la sortie du script
-    eval_loss = None
-    perplexity = None
-    for line in completed.stdout.splitlines():
-        if "eval_loss" in line:
-            eval_loss = float(line.split("=")[-1].strip())
-        if "perplexity" in line:
-            perplexity = float(line.split("=")[-1].strip())
-
-    results.append({
-        "run": run,
-        "eval_loss": eval_loss,
-        "perplexity": perplexity
-    })
-
-# Écriture dans un CSV
-with open(results_file, "w", newline="") as csvfile:
-    fieldnames = ["run", "eval_loss", "perplexity"]
-    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-
-    writer.writeheader()
-    for res in results:
-        writer.writerow(res)
-
-print(f"Résultats enregistrés dans {results_file}")
+            cmd = [
+                "python3", "-m", "torch.distributed.run",
+                "--nproc_per_node=1",
+                "--master_port", "29500",
+                "run_invariant_mlm.py",
+                "--model_name_or_path", model_path,
+                "--do_eval",
+                "--output_dir", eval_out,
+                "--validation_file", test_file
+            ]
+            try:
+                subprocess.run(cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"Échec pour {model_folder} : {e}")
+                continue
