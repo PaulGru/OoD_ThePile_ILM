@@ -11,7 +11,7 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 # ------------------ CONFIG ------------------
-learning_rates = [5e-5]
+learning_rates = [1e-5]
 seeds = [0]  # Seeds for reproducibility
 
 nb_steps = 1000
@@ -68,7 +68,7 @@ def launch_training(model_key):
                     "--per_device_train_batch_size", "128",
                     "--gradient_accumulation_steps", "4",
                     "--preprocessing_num_workers", "16",
-                    "--nb_steps_model_saving", "2500",
+                    "--nb_steps_model_saving", "100",
                     "--learning_rate", str(lr),
                     "--nb_steps", str(nb_steps),
                     "--seed", str(seed),
@@ -84,5 +84,5 @@ def launch_training(model_key):
 
 if __name__ == "__main__":
     t0 = time.time()
-    launch_training("ilmg")
+    launch_training("ilm")
     print(f"[DONE] Temps total : {round(time.time() - t0, 2)}s")
